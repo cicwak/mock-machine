@@ -29,6 +29,7 @@ services:
       context: .
       dockerfile: apps/backend/Dockerfile
     environment:
+      APP_STORAGE: ${APP_STORAGE:-postgres}
       BIND_ADDR: 0.0.0.0:8080
       DATABASE_URL: ${DATABASE_URL:-postgres://mock_machine:mock_machine_dev_password@postgres:5432/mock_machine}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}

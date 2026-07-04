@@ -1,22 +1,23 @@
-use std::{env, net::SocketAddr};
+use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
-use axum::{
-    Json, Router,
-    extract::OriginalUri,
-    http::{Method, StatusCode},
-    response::{IntoResponse, Response},
-    routing::get,
-};
-use serde::Serialize;
-use tower_http::trace::TraceLayer;
+use sea_orm::Database;
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
-#[derive(Serialize)]
-struct HealthResponse<'a> {
-    status: &'a str,
-    service: &'a str,
-}
+mod config;
+mod domain;
+mod entities;
+mod http;
+mod repository;
+mod state;
+
+use config::{AppConfig, StorageMode};
+use repository::{
+    in_memory::InMemoryRepository, minio::MinioObjectAssetRepository, postgres::PostgresRepository,
+    redis::RedisRepository,
+};
+use state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,14 +28,15 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-    let addr: SocketAddr = bind_addr
+    let config = AppConfig::from_env()?;
+    let addr: SocketAddr = config
+        .bind_addr
         .parse()
-        .with_context(|| format!("invalid BIND_ADDR: {bind_addr}"))?;
+        .with_context(|| format!("invalid BIND_ADDR: {}", config.bind_addr))?;
 
-    let app = Router::new()
-        .route("/mockadminapi/health", get(health))
-        .fallback(mock_fallback)
+    let app_state = build_state(&config).await?;
+    let app = http::router(app_state)
+        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -49,17 +51,62 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn health() -> Json<HealthResponse<'static>> {
-    Json(HealthResponse {
-        status: "ok",
-        service: "mock-machine-backend",
-    })
+async fn build_state(config: &AppConfig) -> anyhow::Result<AppState> {
+    match config.storage_mode {
+        StorageMode::Postgres => {
+            let database_url = config
+                .database_url
+                .as_ref()
+                .context("DATABASE_URL must be set")?;
+            let db = Database::connect(database_url)
+                .await
+                .context("failed to connect to PostgreSQL")?;
+            let postgres = Arc::new(PostgresRepository::new(db));
+            let assets = build_asset_repository(config).await;
+
+            Ok(AppState {
+                unknown_requests: postgres.clone(),
+                routes: postgres,
+                assets,
+                storage: "postgres",
+            })
+        }
+        StorageMode::InMemory => {
+            let redis_url = config.redis_url.as_ref().context("REDIS_URL must be set")?;
+            let memory = Arc::new(
+                RedisRepository::new(redis_url)
+                    .await
+                    .context("failed to connect to Redis")?,
+            );
+            Ok(AppState {
+                unknown_requests: memory.clone(),
+                routes: memory.clone(),
+                assets: memory,
+                storage: "in_memory",
+            })
+        }
+    }
 }
 
-async fn mock_fallback(method: Method, OriginalUri(uri): OriginalUri) -> Response {
-    info!(%method, path = %uri.path(), "mock route is not configured yet");
-
-    (StatusCode::NOT_FOUND, "route is not configured").into_response()
+async fn build_asset_repository(config: &AppConfig) -> Arc<dyn repository::ObjectAssetRepository> {
+    match (
+        &config.s3_endpoint,
+        &config.s3_bucket,
+        &config.s3_access_key_id,
+        &config.s3_secret_access_key,
+    ) {
+        (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret_access_key)) => Arc::new(
+            MinioObjectAssetRepository::new(
+                endpoint.clone(),
+                config.s3_region.clone(),
+                bucket.clone(),
+                access_key_id.clone(),
+                secret_access_key.clone(),
+            )
+            .await,
+        ),
+        _ => Arc::new(InMemoryRepository::default()),
+    }
 }
 
 async fn shutdown_signal() {
