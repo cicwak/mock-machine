@@ -2,11 +2,14 @@ export type UnknownRequestStatus = 'new' | 'ignored' | 'converted';
 export type ScenarioKind = 'success' | 'error' | 'timeout' | 'custom';
 export type RouteStatus = 'active' | 'disabled';
 export type ProfileKind = 'static' | 'dynamic';
+export type ProxyUrlMode = 'static' | 'prefix';
 
 export interface Project {
   id: string;
   name: string;
   key: string;
+  default_proxy_enabled: boolean;
+  default_proxy_url: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -52,6 +55,7 @@ export interface RouteProfile {
   profile_kind: ProfileKind;
   kind: ScenarioKind;
   proxy_url: string | null;
+  proxy_url_mode: ProxyUrlMode;
   status_code: number;
   response_headers: Record<string, string>;
   response_body: string | null;
@@ -72,6 +76,7 @@ export interface ConvertForm {
   profileKind: ProfileKind;
   kind: ScenarioKind;
   proxyUrl: string;
+  proxyUrlMode: ProxyUrlMode;
   statusCode: number;
   responseHeaders: string;
   responseBody: string;
@@ -85,6 +90,7 @@ export const emptyForm: ConvertForm = {
   profileKind: 'static',
   kind: 'success',
   proxyUrl: '',
+  proxyUrlMode: 'prefix',
   statusCode: 200,
   responseHeaders: '{\n  "content-type": "application/json"\n}',
   responseBody: '{\n  "ok": true\n}',

@@ -36,6 +36,7 @@ pub struct Model {
     pub profile_kind: ProfileKind,
     pub kind: ScenarioKind,
     pub proxy_url: Option<String>,
+    pub proxy_url_mode: String,
     pub status_code: i32,
     pub response_headers: Value,
     pub response_body: Option<String>,

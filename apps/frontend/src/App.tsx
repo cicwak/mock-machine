@@ -66,6 +66,8 @@ export default function App() {
   const [selectedProjectId, setSelectedProjectId] = useState<string>('');
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [projectName, setProjectName] = useState('');
+  const [defaultProxyEnabled, setDefaultProxyEnabled] = useState(false);
+  const [defaultProxyUrl, setDefaultProxyUrl] = useState('');
   const [unknownRequests, setUnknownRequests] = useState<UnknownRequest[]>([]);
   const [routes, setRoutes] = useState<MockRoute[]>([]);
   const [selected, setSelected] = useState<UnknownRequest | null>(null);
@@ -143,6 +145,11 @@ export default function App() {
   }, [loadData]);
 
   useEffect(() => {
+    setDefaultProxyEnabled(selectedProject?.default_proxy_enabled ?? false);
+    setDefaultProxyUrl(selectedProject?.default_proxy_url ?? '');
+  }, [selectedProject?.id, selectedProject?.default_proxy_enabled, selectedProject?.default_proxy_url]);
+
+  useEffect(() => {
     const socket = io(SOCKET_IO_URL, {
       path: '/socket.io',
       transports: ['websocket', 'polling']
@@ -212,6 +219,31 @@ export default function App() {
           .sort((left, right) => left.name.localeCompare(right.name))
       );
       setNotice('Project key rotated');
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveSelectedProjectSettings() {
+    if (!selectedProjectId) {
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    try {
+      const project = await apiPut<Project>(`/projects/${selectedProjectId}/settings`, {
+        default_proxy_enabled: defaultProxyEnabled,
+        default_proxy_url: defaultProxyUrl.trim() || null
+      });
+      setProjects((current) =>
+        current
+          .map((item) => (item.id === project.id ? project : item))
+          .sort((left, right) => left.name.localeCompare(right.name))
+      );
+      setNotice('Project settings saved');
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -332,6 +364,7 @@ export default function App() {
       profileKind: profile.profile_kind,
       kind: profile.kind,
       proxyUrl: profile.proxy_url ?? '',
+      proxyUrlMode: profile.proxy_url_mode ?? 'prefix',
       statusCode: profile.status_code,
       responseHeaders: JSON.stringify(profile.response_headers, null, 2),
       responseBody: profile.response_body ?? '',
@@ -460,6 +493,11 @@ export default function App() {
               <ProjectSettings
                 project={selectedProject}
                 saving={saving}
+                defaultProxyEnabled={defaultProxyEnabled}
+                onDefaultProxyEnabledChange={setDefaultProxyEnabled}
+                defaultProxyUrl={defaultProxyUrl}
+                onDefaultProxyUrlChange={setDefaultProxyUrl}
+                onSaveSettings={saveSelectedProjectSettings}
                 onRotateKey={rotateSelectedProjectKey}
               />
             )}

@@ -1,15 +1,26 @@
 import AutorenewIcon from '@mui/icons-material/Autorenew';
-import { Box, Button, Stack, TextField, Typography } from '@mui/material';
+import SaveIcon from '@mui/icons-material/Save';
+import { Box, Button, FormControlLabel, Stack, Switch, TextField, Typography } from '@mui/material';
 
 import type { Project } from '../types';
 
 export function ProjectSettings({
   project,
   saving,
+  defaultProxyEnabled,
+  onDefaultProxyEnabledChange,
+  defaultProxyUrl,
+  onDefaultProxyUrlChange,
+  onSaveSettings,
   onRotateKey
 }: {
   project: Project | null;
   saving: boolean;
+  defaultProxyEnabled: boolean;
+  onDefaultProxyEnabledChange: (value: boolean) => void;
+  defaultProxyUrl: string;
+  onDefaultProxyUrlChange: (value: string) => void;
+  onSaveSettings: () => void;
   onRotateKey: () => void;
 }) {
   if (!project) {
@@ -43,6 +54,35 @@ export function ProjectSettings({
             sx={{ minWidth: 150 }}
           >
             Rotate key
+          </Button>
+        </Stack>
+        <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems={{ md: 'center' }}>
+          <FormControlLabel
+            control={
+              <Switch
+                checked={defaultProxyEnabled}
+                onChange={(event) => onDefaultProxyEnabledChange(event.target.checked)}
+              />
+            }
+            label="Default upstream"
+            sx={{ minWidth: 190 }}
+          />
+          <TextField
+            label="Default upstream URL"
+            value={defaultProxyUrl}
+            onChange={(event) => onDefaultProxyUrlChange(event.target.value)}
+            fullWidth
+            placeholder="https://api.example.com"
+            className="monoInput"
+          />
+          <Button
+            variant="contained"
+            startIcon={<SaveIcon />}
+            onClick={onSaveSettings}
+            disabled={saving}
+            sx={{ minWidth: 150 }}
+          >
+            Save
           </Button>
         </Stack>
         <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>

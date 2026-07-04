@@ -9,6 +9,7 @@ export function profilePayload(form: ConvertForm) {
     profile_kind: form.profileKind,
     kind: form.kind,
     proxy_url: form.profileKind === 'dynamic' ? form.proxyUrl : undefined,
+    proxy_url_mode: form.profileKind === 'dynamic' ? form.proxyUrlMode : undefined,
     status_code: form.statusCode,
     response_headers: headers,
     response_body: form.profileKind === 'static' ? form.responseBody : undefined,

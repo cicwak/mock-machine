@@ -36,6 +36,19 @@ pub enum ProfileKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ProxyUrlMode {
+    Static,
+    Prefix,
+}
+
+impl Default for ProxyUrlMode {
+    fn default() -> Self {
+        Self::Prefix
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum UnknownRequestStatus {
     New,
     Ignored,
@@ -57,6 +70,10 @@ pub struct Project {
     pub name: String,
     #[serde(default)]
     pub key: String,
+    #[serde(default)]
+    pub default_proxy_enabled: bool,
+    #[serde(default)]
+    pub default_proxy_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -64,6 +81,12 @@ pub struct Project {
 #[derive(Debug, Clone)]
 pub struct CreateProject {
     pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateProjectSettings {
+    pub default_proxy_enabled: bool,
+    pub default_proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +128,8 @@ pub struct ResponseScenario {
     pub profile_kind: ProfileKind,
     pub kind: ScenarioKind,
     pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub proxy_url_mode: ProxyUrlMode,
     pub status_code: i32,
     pub response_headers: Value,
     pub response_body: Option<String>,
@@ -126,6 +151,7 @@ pub struct CreateScenario {
     pub profile_kind: ProfileKind,
     pub kind: ScenarioKind,
     pub proxy_url: Option<String>,
+    pub proxy_url_mode: ProxyUrlMode,
     pub status_code: i32,
     pub response_headers: Value,
     pub response_body: Option<String>,
@@ -138,6 +164,7 @@ pub struct ConvertUnknownRequest {
     pub name: Option<String>,
     pub tags: Vec<String>,
     pub scenario: CreateScenario,
+    pub additional_scenarios: Vec<CreateScenario>,
 }
 
 #[derive(Debug, Clone)]

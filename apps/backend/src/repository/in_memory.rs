@@ -9,14 +9,14 @@ use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
         CreateProject, CreateScenario, MockRoute, ObjectAsset, Project, ResponseScenario,
-        RouteStatus, UnknownRequest, UnknownRequestStatus, UpsertRoute,
+        RouteStatus, UnknownRequest, UnknownRequestStatus, UpdateProjectSettings, UpsertRoute,
     },
     repository::{
         MockRouteRepository, ObjectAssetRepository, ProjectRepository, RepositoryError,
         RepositoryResult, UnknownRequestRepository,
         validation::{
             normalize_project_key, validate_convert_request, validate_profile_request,
-            validate_project_request, validate_route_request,
+            validate_project_request, validate_project_settings, validate_route_request,
         },
     },
 };
@@ -79,11 +79,28 @@ impl ProjectRepository for InMemoryRepository {
             id: Uuid::new_v4(),
             name: request.name.trim().to_string(),
             key: generate_project_key(projects.values().map(|project| project.key.as_str())),
+            default_proxy_enabled: false,
+            default_proxy_url: None,
             created_at: now,
             updated_at: now,
         };
         projects.insert(project.id, project.clone());
         Ok(project)
+    }
+
+    async fn update_project_settings(
+        &self,
+        id: Uuid,
+        request: UpdateProjectSettings,
+    ) -> RepositoryResult<Project> {
+        validate_project_settings(&request)?;
+        self.ensure_default_project().await;
+        let mut projects = self.projects.write().await;
+        let project = projects.get_mut(&id).ok_or(RepositoryError::NotFound)?;
+        project.default_proxy_enabled = request.default_proxy_enabled;
+        project.default_proxy_url = request.default_proxy_url;
+        project.updated_at = Utc::now();
+        Ok(project.clone())
     }
 
     async fn rotate_project_key(&self, id: Uuid) -> RepositoryResult<Project> {
@@ -129,6 +146,8 @@ impl InMemoryRepository {
             id: Uuid::new_v4(),
             name: "Default".to_string(),
             key: "default".to_string(),
+            default_proxy_enabled: false,
+            default_proxy_url: None,
             created_at: now,
             updated_at: now,
         };
@@ -313,6 +332,7 @@ impl MockRouteRepository for InMemoryRepository {
             profile_kind: request.profile_kind,
             kind: request.kind,
             proxy_url: request.proxy_url,
+            proxy_url_mode: request.proxy_url_mode,
             status_code: request.status_code,
             response_headers: request.response_headers,
             response_body: request.response_body,
@@ -448,6 +468,7 @@ impl MockRouteRepository for InMemoryRepository {
             profile_kind: request.scenario.profile_kind,
             kind: request.scenario.kind,
             proxy_url: request.scenario.proxy_url,
+            proxy_url_mode: request.scenario.proxy_url_mode,
             status_code: request.scenario.status_code,
             response_headers: request.scenario.response_headers,
             response_body: request.scenario.response_body,
@@ -456,12 +477,33 @@ impl MockRouteRepository for InMemoryRepository {
             created_at: now,
             updated_at: now,
         };
+        let additional_scenarios = request
+            .additional_scenarios
+            .into_iter()
+            .map(|scenario| ResponseScenario {
+                id: Uuid::new_v4(),
+                route_id,
+                name: scenario.name,
+                profile_kind: scenario.profile_kind,
+                kind: scenario.kind,
+                proxy_url: scenario.proxy_url,
+                proxy_url_mode: scenario.proxy_url_mode,
+                status_code: scenario.status_code,
+                response_headers: scenario.response_headers,
+                response_body: scenario.response_body,
+                delay_ms: scenario.delay_ms,
+                selection_rules: scenario.selection_rules,
+                created_at: now,
+                updated_at: now,
+            })
+            .collect::<Vec<_>>();
 
         self.routes.write().await.insert(route_id, route.clone());
-        self.scenarios
-            .write()
-            .await
-            .insert(scenario_id, scenario.clone());
+        let mut scenarios = self.scenarios.write().await;
+        scenarios.insert(scenario_id, scenario.clone());
+        for additional in additional_scenarios {
+            scenarios.insert(additional.id, additional);
+        }
 
         unknown.status = UnknownRequestStatus::Converted;
         unknown.converted_route_id = Some(route_id);
@@ -519,4 +561,89 @@ fn generate_project_key<'a>(existing: impl Iterator<Item = &'a str>) -> String {
     }
 
     Uuid::new_v4().simple().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::domain::{ProfileKind, ProxyUrlMode, ScenarioKind};
+
+    #[tokio::test]
+    async fn convert_unknown_request_persists_additional_scenarios() {
+        let repository = InMemoryRepository::default();
+        let project = repository
+            .create_project(CreateProject {
+                name: "project".to_string(),
+            })
+            .await
+            .expect("project should be created");
+        let unknown = repository
+            .capture(
+                project.id,
+                CapturedRequest {
+                    method: "GET".to_string(),
+                    path: "/users/1".to_string(),
+                    query: json!({}),
+                    headers: json!({}),
+                    body: None,
+                },
+            )
+            .await
+            .expect("unknown request should be captured");
+
+        let converted = repository
+            .convert_unknown_request(
+                project.id,
+                unknown.id,
+                ConvertUnknownRequest {
+                    name: None,
+                    tags: vec![],
+                    scenario: CreateScenario {
+                        name: "captured response".to_string(),
+                        profile_kind: ProfileKind::Static,
+                        kind: ScenarioKind::Success,
+                        proxy_url: None,
+                        proxy_url_mode: ProxyUrlMode::Static,
+                        status_code: 200,
+                        response_headers: json!({}),
+                        response_body: Some("{\"ok\":true}".to_string()),
+                        delay_ms: 0,
+                        selection_rules: json!({}),
+                    },
+                    additional_scenarios: vec![CreateScenario {
+                        name: "default upstream".to_string(),
+                        profile_kind: ProfileKind::Dynamic,
+                        kind: ScenarioKind::Success,
+                        proxy_url: Some("https://api.example.com".to_string()),
+                        proxy_url_mode: ProxyUrlMode::Prefix,
+                        status_code: 200,
+                        response_headers: json!({}),
+                        response_body: None,
+                        delay_ms: 0,
+                        selection_rules: json!({}),
+                    }],
+                },
+            )
+            .await
+            .expect("unknown request should be converted");
+
+        let profiles = repository
+            .list_profiles(converted.route.id)
+            .await
+            .expect("profiles should be listed");
+
+        assert_eq!(profiles.len(), 2);
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| profile.name == "captured response")
+        );
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| profile.name == "default upstream")
+        );
+    }
 }
