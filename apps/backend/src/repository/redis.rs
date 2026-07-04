@@ -306,7 +306,7 @@ impl MockRouteRepository for RedisRepository {
             return Err(RepositoryError::NotFound);
         };
         let profile = load_json::<ResponseScenario>(&mut conn, &scenario_key(profile_id)).await?;
-        if !profile.is_some_and(|profile| profile.route_id == route_id) {
+        if profile.is_none_or(|profile| profile.route_id != route_id) {
             return Err(RepositoryError::NotFound);
         }
         route.active_scenario_id = Some(profile_id);

@@ -82,7 +82,7 @@ impl UnknownRequestRepository for InMemoryRepository {
             .cloned()
             .collect::<Vec<_>>();
 
-        values.sort_by(|left, right| right.last_seen_at.cmp(&left.last_seen_at));
+        values.sort_by_key(|request| std::cmp::Reverse(request.last_seen_at));
         values.truncate(limit as usize);
         Ok(values)
     }
