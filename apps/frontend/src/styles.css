@@ -1,0 +1,100 @@
+:root {
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #1c2430;
+  background: #f4f6f8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+.appShell {
+  min-height: 100vh;
+  background: #f4f6f8;
+}
+
+.topBar {
+  border-bottom: 1px solid #dfe5ef;
+}
+
+.metricPanel {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 16px;
+  border-radius: 8px;
+}
+
+.metricIcon {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  color: #0f5f80;
+  background: #e7f3f8;
+}
+
+.workspacePanel {
+  min-height: 560px;
+  overflow: hidden;
+  border-radius: 8px;
+}
+
+.panelHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 56px;
+  padding: 0 16px;
+  border-bottom: 1px solid #dfe5ef;
+}
+
+.methodChip {
+  min-width: 58px;
+  font-weight: 700;
+}
+
+.pathCell {
+  max-width: 420px;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.85rem;
+}
+
+.bodyCell {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.8rem;
+  color: #4a5568;
+}
+
+.emptyCell {
+  height: 180px;
+  color: #64748b;
+}
+
+.dialogTitle {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.monoInput textarea,
+.monoInput input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.86rem;
+}

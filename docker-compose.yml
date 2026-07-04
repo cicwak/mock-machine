@@ -1,0 +1,135 @@
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_healthy
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./infra/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - mock-machine
+
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+    environment:
+      VITE_API_BASE_URL: /mockadminapi
+    expose:
+      - "5173"
+    networks:
+      - mock-machine
+
+  backend:
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    environment:
+      APP_STORAGE: ${APP_STORAGE:-postgres}
+      BIND_ADDR: 0.0.0.0:8080
+      DATABASE_URL: ${DATABASE_URL:-postgres://mock_machine:mock_machine_dev_password@postgres:5432/mock_machine}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_REGION: ${MINIO_REGION:-us-east-1}
+      S3_BUCKET: ${MINIO_BUCKET:-mock-machine-files}
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:-mock_machine_app}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:-mock_machine_app_secret}
+      RUST_LOG: ${RUST_LOG:-mock_machine=info,tower_http=info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/mockadminapi/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - mock-machine
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mock_machine}
+      POSTGRES_USER: ${POSTGRES_USER:-mock_machine}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mock_machine_dev_password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - mock-machine
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks:
+      - mock-machine
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-mock_machine_root}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-mock_machine_root_password}
+      MINIO_REGION_NAME: ${MINIO_REGION:-us-east-1}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - mock-machine
+
+  minio-bootstrap:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-mock_machine_root}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-mock_machine_root_password}
+      MINIO_BUCKET: ${MINIO_BUCKET:-mock-machine-files}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-mock_machine_app}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-mock_machine_app_secret}
+    volumes:
+      - ./infra/minio/policies:/policies:ro
+      - ./infra/minio/scripts:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/bootstrap.sh"]
+    networks:
+      - mock-machine
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+
+networks:
+  mock-machine:
+    name: mock-machine
