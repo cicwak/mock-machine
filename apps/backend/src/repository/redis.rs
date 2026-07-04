@@ -83,7 +83,7 @@ impl ProjectRepository for RedisRepository {
         for id in ids {
             let id = Uuid::parse_str(&id).context("invalid project id in Redis")?;
             if let Some(project) = load_json::<Project>(&mut conn, &project_key(id)).await? {
-                projects.push(project);
+                projects.push(ensure_project_key(&mut conn, project).await?);
             }
         }
 
@@ -94,7 +94,27 @@ impl ProjectRepository for RedisRepository {
     async fn get_project(&self, id: Uuid) -> RepositoryResult<Option<Project>> {
         let mut conn = self.conn().await?;
         ensure_default_project(&mut conn).await?;
-        load_json(&mut conn, &project_key(id)).await
+        match load_json(&mut conn, &project_key(id)).await? {
+            Some(project) => Ok(Some(ensure_project_key(&mut conn, project).await?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn get_project_by_key(&self, key: &str) -> RepositoryResult<Option<Project>> {
+        let mut conn = self.conn().await?;
+        ensure_default_project(&mut conn).await?;
+        let key = normalize_project_key(key)?;
+        let Some(id) = conn
+            .get::<_, Option<String>>(project_key_index_key(&key))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let id = Uuid::parse_str(&id).context("invalid project id in Redis")?;
+        match load_json(&mut conn, &project_key(id)).await? {
+            Some(project) => Ok(Some(ensure_project_key(&mut conn, project).await?)),
+            None => Ok(None),
+        }
     }
 
     async fn create_project(&self, request: CreateProject) -> RepositoryResult<Project> {
@@ -110,15 +130,18 @@ impl ProjectRepository for RedisRepository {
         }
 
         let now = Utc::now();
+        let key = generate_project_key(&mut conn).await?;
         let project = Project {
             id: Uuid::new_v4(),
             name,
+            key,
             created_at: now,
             updated_at: now,
         };
         let _: () = redis::pipe()
             .set(project_key(project.id), serde_json::to_string(&project)?)
             .set(name_index, project.id.to_string())
+            .set(project_key_index_key(&project.key), project.id.to_string())
             .zadd(
                 PROJECT_SET,
                 project.id.to_string(),
@@ -126,6 +149,28 @@ impl ProjectRepository for RedisRepository {
             )
             .query_async(&mut conn)
             .await?;
+        Ok(project)
+    }
+
+    async fn rotate_project_key(&self, id: Uuid) -> RepositoryResult<Project> {
+        let mut conn = self.conn().await?;
+        ensure_default_project(&mut conn).await?;
+        let Some(mut project) = load_json::<Project>(&mut conn, &project_key(id)).await? else {
+            return Err(RepositoryError::NotFound);
+        };
+
+        project = ensure_project_key(&mut conn, project).await?;
+        let old_key = project.key.clone();
+        project.key = generate_project_key(&mut conn).await?;
+        project.updated_at = Utc::now();
+
+        let _: () = redis::pipe()
+            .set(project_key(project.id), serde_json::to_string(&project)?)
+            .del(project_key_index_key(&old_key))
+            .set(project_key_index_key(&project.key), project.id.to_string())
+            .query_async(&mut conn)
+            .await?;
+
         Ok(project)
     }
 }
@@ -611,6 +656,29 @@ fn validate_project_request(request: &CreateProject) -> RepositoryResult<()> {
     Ok(())
 }
 
+fn normalize_project_key(key: &str) -> RepositoryResult<String> {
+    let key = key.trim().to_ascii_lowercase();
+    if is_valid_project_key(&key) {
+        Ok(key)
+    } else {
+        Err(RepositoryError::Validation(
+            "project key must be 3-32 chars and contain only lowercase letters, numbers, and hyphens"
+                .to_string(),
+        ))
+    }
+}
+
+fn is_valid_project_key(key: &str) -> bool {
+    (3..=32).contains(&key.len())
+        && key
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        && key
+            .bytes()
+            .next()
+            .is_some_and(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9'))
+}
+
 fn validate_route_request(request: &UpsertRoute) -> RepositoryResult<()> {
     if !is_valid_http_method(&request.method) {
         return Err(RepositoryError::Validation(
@@ -710,6 +778,10 @@ fn project_name_index_key(name: &str) -> String {
     format!("mock-machine:project-name:{}", name.to_ascii_lowercase())
 }
 
+fn project_key_index_key(key: &str) -> String {
+    format!("mock-machine:project-key:{}", key.to_ascii_lowercase())
+}
+
 fn scenario_key(id: Uuid) -> String {
     format!("mock-machine:scenario:{id}")
 }
@@ -741,7 +813,7 @@ async fn ensure_default_project(
     if let Some(id) = conn.get::<_, Option<String>>(&name_index).await? {
         let id = Uuid::parse_str(&id).context("invalid default project id in Redis")?;
         if let Some(project) = load_json::<Project>(conn, &project_key(id)).await? {
-            return Ok(project);
+            return ensure_project_key(conn, project).await;
         }
     }
 
@@ -749,12 +821,14 @@ async fn ensure_default_project(
     let project = Project {
         id: Uuid::new_v4(),
         name: "Default".to_string(),
+        key: "default".to_string(),
         created_at: now,
         updated_at: now,
     };
     let _: () = redis::pipe()
         .set(project_key(project.id), serde_json::to_string(&project)?)
         .set(name_index, project.id.to_string())
+        .set(project_key_index_key(&project.key), project.id.to_string())
         .zadd(
             PROJECT_SET,
             project.id.to_string(),
@@ -763,4 +837,50 @@ async fn ensure_default_project(
         .query_async(conn)
         .await?;
     Ok(project)
+}
+
+async fn ensure_project_key(
+    conn: &mut redis::aio::MultiplexedConnection,
+    mut project: Project,
+) -> RepositoryResult<Project> {
+    if !project.key.is_empty() {
+        let _: () = conn
+            .set(project_key_index_key(&project.key), project.id.to_string())
+            .await?;
+        return Ok(project);
+    }
+
+    project.key = if project.name == "Default" {
+        "default".to_string()
+    } else {
+        generate_project_key(conn).await?
+    };
+    project.updated_at = Utc::now();
+    let _: () = redis::pipe()
+        .set(project_key(project.id), serde_json::to_string(&project)?)
+        .set(project_key_index_key(&project.key), project.id.to_string())
+        .query_async(conn)
+        .await?;
+    Ok(project)
+}
+
+async fn generate_project_key(
+    conn: &mut redis::aio::MultiplexedConnection,
+) -> RepositoryResult<String> {
+    for length in 8..=32 {
+        for _ in 0..32 {
+            let raw = Uuid::new_v4().simple().to_string();
+            let candidate = raw[..length].to_string();
+            if !conn
+                .exists::<_, bool>(project_key_index_key(&candidate))
+                .await?
+            {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(RepositoryError::Internal(anyhow::anyhow!(
+        "failed to generate unique project key"
+    )))
 }

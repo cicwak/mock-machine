@@ -55,6 +55,8 @@ pub struct CapturedRequest {
 pub struct Project {
     pub id: Uuid,
     pub name: String,
+    #[serde(default)]
+    pub key: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

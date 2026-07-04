@@ -168,6 +168,7 @@ pub fn router(state: AppState) -> Router {
             "/mockadminapi/projects/{id}/active",
             put(set_active_project),
         )
+        .route("/mockadminapi/projects/{id}/key", put(rotate_project_key))
         .route("/mockadminapi/routes", get(list_routes).post(create_route))
         .route(
             "/mockadminapi/routes/{id}",
@@ -233,6 +234,14 @@ async fn set_active_project(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, AppError> {
     let project = set_active_project_id(&state, id).await?;
+    Ok(Json(json!(project)))
+}
+
+async fn rotate_project_key(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let project = state.projects.rotate_project_key(id).await?;
     Ok(Json(json!(project)))
 }
 
@@ -425,7 +434,7 @@ async fn mock_fallback(
         ));
     }
 
-    let project_id = active_project_id(&state).await?;
+    let project_id = mock_project_id(&state, &headers).await?;
 
     if let Some(active_response) = state
         .routes
@@ -620,6 +629,25 @@ async fn active_project_id(state: &AppState) -> Result<Uuid, AppError> {
         .first()
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("no projects are available")))?;
     set_active_project_id(state, project.id).await?;
+    Ok(project.id)
+}
+
+async fn mock_project_id(state: &AppState, headers: &HeaderMap) -> Result<Uuid, AppError> {
+    let Some(project_key) = headers
+        .get("x-mock-project")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return active_project_id(state).await;
+    };
+
+    let project = state
+        .projects
+        .get_project_by_key(project_key)
+        .await?
+        .ok_or_else(|| AppError::NotFound("project key not found".to_string()))?;
+
     Ok(project.id)
 }
 

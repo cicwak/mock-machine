@@ -126,6 +126,7 @@ type CommonHttpMethod = (typeof COMMON_HTTP_METHODS)[number];
 interface Project {
   id: string;
   name: string;
+  key: string;
   created_at: string;
   updated_at: string;
 }
@@ -255,6 +256,10 @@ export default function App() {
     () => unknownRequests.filter((request) => request.status === 'new').length,
     [unknownRequests]
   );
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.id === selectedProjectId) ?? null,
+    [projects, selectedProjectId]
+  );
 
   const loadProjects = useCallback(async () => {
     setLoading(true);
@@ -350,6 +355,28 @@ export default function App() {
       setProjectName('');
       setProjectDialogOpen(false);
       setNotice('Project created');
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function rotateSelectedProjectKey() {
+    if (!selectedProjectId) {
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    try {
+      const project = await apiPut<Project>(`/projects/${selectedProjectId}/key`, {});
+      setProjects((current) =>
+        current
+          .map((item) => (item.id === project.id ? project : item))
+          .sort((left, right) => left.name.localeCompare(right.name))
+      );
+      setNotice('Project key rotated');
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -581,6 +608,7 @@ export default function App() {
               <Tabs value={tab} onChange={(_, nextTab) => setTab(nextTab)} aria-label="admin sections">
                 <Tab icon={<InboxIcon />} iconPosition="start" label="Unknown" />
                 <Tab icon={<RouteIcon />} iconPosition="start" label="Routes" />
+                <Tab icon={<SettingsIcon />} iconPosition="start" label="Project" />
               </Tabs>
               {loading && <CircularProgress size={22} />}
             </Box>
@@ -591,8 +619,14 @@ export default function App() {
                 loading={loading}
                 onConvert={openConvertDialog}
               />
-            ) : (
+            ) : tab === 1 ? (
               <RoutesTable routes={routes} loading={loading} onEdit={openRouteSettings} />
+            ) : (
+              <ProjectSettings
+                project={selectedProject}
+                saving={saving}
+                onRotateKey={rotateSelectedProjectKey}
+              />
             )}
           </Paper>
         </Stack>
@@ -791,6 +825,69 @@ function RoutesTable({
         </TableBody>
       </Table>
     </TableContainer>
+  );
+}
+
+function ProjectSettings({
+  project,
+  saving,
+  onRotateKey
+}: {
+  project: Project | null;
+  saving: boolean;
+  onRotateKey: () => void;
+}) {
+  if (!project) {
+    return (
+      <Box className="emptyCell">
+        <Typography color="text.secondary">No project selected</Typography>
+      </Box>
+    );
+  }
+
+  return (
+    <Box sx={{ p: 2.5 }}>
+      <Stack spacing={2.5} maxWidth={720}>
+        <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+          <TextField label="Project name" value={project.name} fullWidth InputProps={{ readOnly: true }} />
+          <TextField label="Project ID" value={project.id} fullWidth InputProps={{ readOnly: true }} />
+        </Stack>
+        <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems={{ md: 'center' }}>
+          <TextField
+            label="Project key"
+            value={project.key}
+            fullWidth
+            className="monoInput"
+            InputProps={{ readOnly: true }}
+          />
+          <Button
+            variant="outlined"
+            startIcon={<AutorenewIcon />}
+            onClick={onRotateKey}
+            disabled={saving}
+            sx={{ minWidth: 150 }}
+          >
+            Rotate key
+          </Button>
+        </Stack>
+        <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+          <TextField
+            label="Header"
+            value={`X-Mock-Project: ${project.key}`}
+            fullWidth
+            className="monoInput"
+            InputProps={{ readOnly: true }}
+          />
+          <TextField
+            label="Host key"
+            value={`${project.key}.mock-machine.example.com`}
+            fullWidth
+            className="monoInput"
+            InputProps={{ readOnly: true }}
+          />
+        </Stack>
+      </Stack>
+    </Box>
   );
 }
 

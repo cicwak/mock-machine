@@ -1,4 +1,5 @@
 use anyhow::Context;
+use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
     DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
@@ -52,17 +53,63 @@ impl ProjectRepository for PostgresRepository {
         model.map(Project::try_from).transpose()
     }
 
+    async fn get_project_by_key(&self, key: &str) -> RepositoryResult<Option<Project>> {
+        let key = normalize_project_key(key)?;
+        let model = projects::Entity::find()
+            .filter(projects::Column::Key.eq(key))
+            .one(&self.db)
+            .await
+            .context("failed to get project by key")?;
+
+        model.map(Project::try_from).transpose()
+    }
+
     async fn create_project(&self, request: CreateProject) -> RepositoryResult<Project> {
         validate_project_request(&request)?;
 
-        projects::ActiveModel {
-            name: Set(request.name.trim().to_string()),
-            ..Default::default()
+        for key in project_key_candidates() {
+            let result = projects::ActiveModel {
+                name: Set(request.name.trim().to_string()),
+                key: Set(key),
+                ..Default::default()
+            }
+            .insert(&self.db)
+            .await;
+
+            match result {
+                Ok(project) => return project.try_into(),
+                Err(error) if is_project_key_conflict(&error) => continue,
+                Err(error) => return Err(map_project_write_error(error)),
+            }
         }
-        .insert(&self.db)
-        .await
-        .map_err(map_project_write_error)?
-        .try_into()
+
+        Err(RepositoryError::Internal(anyhow::anyhow!(
+            "failed to generate unique project key"
+        )))
+    }
+
+    async fn rotate_project_key(&self, id: Uuid) -> RepositoryResult<Project> {
+        for key in project_key_candidates() {
+            let project = projects::Entity::find_by_id(id)
+                .one(&self.db)
+                .await
+                .context("failed to load project")?
+                .ok_or(RepositoryError::NotFound)?;
+
+            let mut update: projects::ActiveModel = project.into();
+            update.key = Set(key);
+            update.updated_at = Set(Utc::now());
+
+            match update.update(&self.db).await {
+                Ok(project) => return project.try_into(),
+                Err(error) if is_project_key_conflict(&error) => continue,
+                Err(error) => return Err(map_project_write_error(error)),
+            }
+        }
+
+        Err(RepositoryError::Internal(anyhow::anyhow!(
+            "failed to generate unique project key"
+        )))
     }
 }
 
@@ -629,6 +676,7 @@ impl TryFrom<projects::Model> for Project {
         Ok(Self {
             id: value.id,
             name: value.name,
+            key: value.key,
             created_at: value.created_at,
             updated_at: value.updated_at,
         })
@@ -723,8 +771,11 @@ fn map_route_write_error(error: sea_orm::DbErr) -> RepositoryError {
 }
 
 fn map_project_write_error(error: sea_orm::DbErr) -> RepositoryError {
-    if error.to_string().contains("projects_name_key") {
+    let message = error.to_string();
+    if message.contains("projects_name_key") {
         RepositoryError::Conflict("project already exists with this name".to_string())
+    } else if message.contains("projects_key_key") {
+        RepositoryError::Conflict("project already exists with this key".to_string())
     } else {
         RepositoryError::Internal(error.into())
     }
@@ -760,6 +811,42 @@ fn validate_project_request(request: &CreateProject) -> RepositoryResult<()> {
         ));
     }
     Ok(())
+}
+
+fn project_key_candidates() -> impl Iterator<Item = String> {
+    (8..=32).flat_map(|length| {
+        (0..32).map(move |_| {
+            let raw = Uuid::new_v4().simple().to_string();
+            raw[..length].to_string()
+        })
+    })
+}
+
+fn normalize_project_key(key: &str) -> RepositoryResult<String> {
+    let key = key.trim().to_ascii_lowercase();
+    if is_valid_project_key(&key) {
+        Ok(key)
+    } else {
+        Err(RepositoryError::Validation(
+            "project key must be 3-32 chars and contain only lowercase letters, numbers, and hyphens"
+                .to_string(),
+        ))
+    }
+}
+
+fn is_valid_project_key(key: &str) -> bool {
+    (3..=32).contains(&key.len())
+        && key
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        && key
+            .bytes()
+            .next()
+            .is_some_and(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9'))
+}
+
+fn is_project_key_conflict(error: &sea_orm::DbErr) -> bool {
+    error.to_string().contains("projects_key_key")
 }
 
 fn to_db_route_status(status: crate::domain::RouteStatus) -> mock_routes::RouteStatus {

@@ -48,6 +48,18 @@ impl ProjectRepository for InMemoryRepository {
         Ok(self.projects.read().await.get(&id).cloned())
     }
 
+    async fn get_project_by_key(&self, key: &str) -> RepositoryResult<Option<Project>> {
+        self.ensure_default_project().await;
+        let key = normalize_project_key(key)?;
+        Ok(self
+            .projects
+            .read()
+            .await
+            .values()
+            .find(|project| project.key == key)
+            .cloned())
+    }
+
     async fn create_project(&self, request: CreateProject) -> RepositoryResult<Project> {
         validate_project_request(&request)?;
         let mut projects = self.projects.write().await;
@@ -63,11 +75,27 @@ impl ProjectRepository for InMemoryRepository {
         let project = Project {
             id: Uuid::new_v4(),
             name: request.name.trim().to_string(),
+            key: generate_project_key(projects.values().map(|project| project.key.as_str())),
             created_at: now,
             updated_at: now,
         };
         projects.insert(project.id, project.clone());
         Ok(project)
+    }
+
+    async fn rotate_project_key(&self, id: Uuid) -> RepositoryResult<Project> {
+        self.ensure_default_project().await;
+        let mut projects = self.projects.write().await;
+        let new_key = generate_project_key(
+            projects
+                .values()
+                .filter(|project| project.id != id)
+                .map(|project| project.key.as_str()),
+        );
+        let project = projects.get_mut(&id).ok_or(RepositoryError::NotFound)?;
+        project.key = new_key;
+        project.updated_at = Utc::now();
+        Ok(project.clone())
     }
 }
 
@@ -97,6 +125,7 @@ impl InMemoryRepository {
         let project = Project {
             id: Uuid::new_v4(),
             name: "Default".to_string(),
+            key: "default".to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -484,6 +513,45 @@ fn validate_project_request(request: &CreateProject) -> RepositoryResult<()> {
         ));
     }
     Ok(())
+}
+
+fn normalize_project_key(key: &str) -> RepositoryResult<String> {
+    let key = key.trim().to_ascii_lowercase();
+    if is_valid_project_key(&key) {
+        Ok(key)
+    } else {
+        Err(RepositoryError::Validation(
+            "project key must be 3-32 chars and contain only lowercase letters, numbers, and hyphens"
+                .to_string(),
+        ))
+    }
+}
+
+fn generate_project_key<'a>(existing: impl Iterator<Item = &'a str>) -> String {
+    let existing = existing.collect::<std::collections::HashSet<_>>();
+
+    for length in 8..=32 {
+        for _ in 0..32 {
+            let raw = Uuid::new_v4().simple().to_string();
+            let candidate = raw[..length].to_string();
+            if !existing.contains(candidate.as_str()) {
+                return candidate;
+            }
+        }
+    }
+
+    Uuid::new_v4().simple().to_string()
+}
+
+fn is_valid_project_key(key: &str) -> bool {
+    (3..=32).contains(&key.len())
+        && key
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        && key
+            .bytes()
+            .next()
+            .is_some_and(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9'))
 }
 
 fn validate_route_request(request: &UpsertRoute) -> RepositoryResult<()> {

@@ -46,7 +46,11 @@ pub trait ProjectRepository: Send + Sync {
 
     async fn get_project(&self, id: Uuid) -> RepositoryResult<Option<Project>>;
 
+    async fn get_project_by_key(&self, key: &str) -> RepositoryResult<Option<Project>>;
+
     async fn create_project(&self, request: CreateProject) -> RepositoryResult<Project>;
+
+    async fn rotate_project_key(&self, id: Uuid) -> RepositoryResult<Project>;
 }
 
 #[async_trait]

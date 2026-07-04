@@ -37,3 +37,13 @@ Accepted
 - `/mockadminapi` и `/mockadminapi/*` зарезервированы и не могут использоваться как mock routes.
 - Backend должен корректно обрабатывать все остальные пути как потенциальные mock requests или admin API.
 - Frontend должен быть собран с учетом base path `/mockadmin`.
+
+## Project subdomains
+
+Для изоляции проектов в production mock-запросы могут идти на wildcard
+subdomain вида `<project-key>.mock-machine.example.com`. Nginx извлекает
+`project-key` из hostname и передает его backend-у в заголовке
+`X-Mock-Project`.
+
+Примеры конфигурации лежат в
+`infra/nginx/project-subdomains.example.conf`.
