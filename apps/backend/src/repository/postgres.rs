@@ -10,8 +10,9 @@ use uuid::Uuid;
 use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
-        CreateProject, CreateScenario, MockRoute, ProfileKind, Project, ResponseScenario,
-        ScenarioKind, UnknownRequest, UnknownRequestStatus, UpsertRoute,
+        CreateProject, CreateScenario, MockRoute, ProfileKind, Project, ProxyUrlMode,
+        ResponseScenario, ScenarioKind, UnknownRequest, UnknownRequestStatus,
+        UpdateProjectSettings, UpsertRoute,
     },
     entities::{mock_routes, projects, response_scenarios, unknown_requests},
     repository::{
@@ -19,7 +20,7 @@ use crate::{
         UnknownRequestRepository,
         validation::{
             normalize_project_key, validate_convert_request, validate_profile_request,
-            validate_project_request, validate_route_request,
+            validate_project_request, validate_project_settings, validate_route_request,
         },
     },
 };
@@ -90,6 +91,29 @@ impl ProjectRepository for PostgresRepository {
         Err(RepositoryError::Internal(anyhow::anyhow!(
             "failed to generate unique project key"
         )))
+    }
+
+    async fn update_project_settings(
+        &self,
+        id: Uuid,
+        request: UpdateProjectSettings,
+    ) -> RepositoryResult<Project> {
+        validate_project_settings(&request)?;
+        let project = projects::Entity::find_by_id(id)
+            .one(&self.db)
+            .await
+            .context("failed to load project")?
+            .ok_or(RepositoryError::NotFound)?;
+
+        let mut update: projects::ActiveModel = project.into();
+        update.default_proxy_enabled = Set(request.default_proxy_enabled);
+        update.default_proxy_url = Set(request.default_proxy_url);
+        update.updated_at = Set(Utc::now());
+        update
+            .update(&self.db)
+            .await
+            .context("failed to update project settings")?
+            .try_into()
     }
 
     async fn rotate_project_key(&self, id: Uuid) -> RepositoryResult<Project> {
@@ -273,6 +297,7 @@ impl MockRouteRepository for PostgresRepository {
             profile_kind: Set(to_db_profile_kind(request.profile_kind)),
             kind: Set(to_db_scenario_kind(request.kind)),
             proxy_url: Set(request.proxy_url),
+            proxy_url_mode: Set(to_db_proxy_url_mode(request.proxy_url_mode)),
             status_code: Set(request.status_code),
             response_headers: Set(request.response_headers),
             response_body: Set(request.response_body),
@@ -502,6 +527,7 @@ async fn convert_unknown_request_tx(
         profile_kind: Set(to_db_profile_kind(request.scenario.profile_kind)),
         kind: Set(to_db_scenario_kind(request.scenario.kind)),
         proxy_url: Set(request.scenario.proxy_url),
+        proxy_url_mode: Set(to_db_proxy_url_mode(request.scenario.proxy_url_mode)),
         status_code: Set(request.scenario.status_code),
         response_headers: Set(request.scenario.response_headers),
         response_body: Set(request.scenario.response_body),
@@ -512,6 +538,26 @@ async fn convert_unknown_request_tx(
     .insert(tx)
     .await
     .context("failed to insert response scenario")?;
+
+    for additional in request.additional_scenarios {
+        response_scenarios::ActiveModel {
+            route_id: Set(route.id),
+            name: Set(additional.name),
+            profile_kind: Set(to_db_profile_kind(additional.profile_kind)),
+            kind: Set(to_db_scenario_kind(additional.kind)),
+            proxy_url: Set(additional.proxy_url),
+            proxy_url_mode: Set(to_db_proxy_url_mode(additional.proxy_url_mode)),
+            status_code: Set(additional.status_code),
+            response_headers: Set(additional.response_headers),
+            response_body: Set(additional.response_body),
+            delay_ms: Set(additional.delay_ms),
+            selection_rules: Set(additional.selection_rules),
+            ..Default::default()
+        }
+        .insert(tx)
+        .await
+        .map_err(map_profile_insert_error)?;
+    }
 
     let mut route_update: mock_routes::ActiveModel = route.clone().into();
     route_update.active_scenario_id = Set(Some(scenario.id));
@@ -612,6 +658,8 @@ impl TryFrom<projects::Model> for Project {
             id: value.id,
             name: value.name,
             key: value.key,
+            default_proxy_enabled: value.default_proxy_enabled,
+            default_proxy_url: value.default_proxy_url,
             created_at: value.created_at,
             updated_at: value.updated_at,
         })
@@ -629,6 +677,7 @@ impl TryFrom<response_scenarios::Model> for ResponseScenario {
             profile_kind: from_db_profile_kind(value.profile_kind),
             kind: from_db_scenario_kind(value.kind),
             proxy_url: value.proxy_url,
+            proxy_url_mode: from_db_proxy_url_mode(&value.proxy_url_mode)?,
             status_code: value.status_code,
             response_headers: value.response_headers,
             response_body: value.response_body,
@@ -732,6 +781,7 @@ fn fill_profile_model(model: &mut response_scenarios::ActiveModel, request: Crea
     model.profile_kind = Set(to_db_profile_kind(request.profile_kind));
     model.kind = Set(to_db_scenario_kind(request.kind));
     model.proxy_url = Set(request.proxy_url);
+    model.proxy_url_mode = Set(to_db_proxy_url_mode(request.proxy_url_mode));
     model.status_code = Set(request.status_code);
     model.response_headers = Set(request.response_headers);
     model.response_body = Set(request.response_body);
@@ -770,6 +820,23 @@ fn from_db_profile_kind(kind: response_scenarios::ProfileKind) -> ProfileKind {
     match kind {
         response_scenarios::ProfileKind::Static => ProfileKind::Static,
         response_scenarios::ProfileKind::Dynamic => ProfileKind::Dynamic,
+    }
+}
+
+fn to_db_proxy_url_mode(mode: ProxyUrlMode) -> String {
+    match mode {
+        ProxyUrlMode::Static => "static".to_string(),
+        ProxyUrlMode::Prefix => "prefix".to_string(),
+    }
+}
+
+fn from_db_proxy_url_mode(mode: &str) -> RepositoryResult<ProxyUrlMode> {
+    match mode {
+        "static" => Ok(ProxyUrlMode::Static),
+        "prefix" => Ok(ProxyUrlMode::Prefix),
+        value => Err(RepositoryError::Internal(anyhow::anyhow!(
+            "invalid proxy_url_mode: {value}"
+        ))),
     }
 }
 

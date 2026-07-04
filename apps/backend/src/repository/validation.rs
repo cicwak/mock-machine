@@ -1,13 +1,17 @@
 use crate::{
     domain::{
-        ConvertUnknownRequest, CreateProject, CreateScenario, ProfileKind, UpsertRoute,
-        is_valid_http_method,
+        ConvertUnknownRequest, CreateProject, CreateScenario, ProfileKind, UpdateProjectSettings,
+        UpsertRoute, is_valid_http_method,
     },
     repository::{RepositoryError, RepositoryResult},
 };
 
 pub fn validate_convert_request(request: &ConvertUnknownRequest) -> RepositoryResult<()> {
-    validate_profile_request(&request.scenario)
+    validate_profile_request(&request.scenario)?;
+    for scenario in &request.additional_scenarios {
+        validate_profile_request(scenario)?;
+    }
+    Ok(())
 }
 
 pub fn validate_project_request(request: &CreateProject) -> RepositoryResult<()> {
@@ -16,6 +20,18 @@ pub fn validate_project_request(request: &CreateProject) -> RepositoryResult<()>
             "project.name cannot be empty".to_string(),
         ));
     }
+    Ok(())
+}
+
+pub fn validate_project_settings(request: &UpdateProjectSettings) -> RepositoryResult<()> {
+    if let Some(default_proxy_url) = request.default_proxy_url.as_deref()
+        && !(default_proxy_url.starts_with("http://") || default_proxy_url.starts_with("https://"))
+    {
+        return Err(RepositoryError::Validation(
+            "project.default_proxy_url must be an http(s) URL".to_string(),
+        ));
+    }
+
     Ok(())
 }
 

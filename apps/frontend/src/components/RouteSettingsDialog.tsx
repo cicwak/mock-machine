@@ -33,7 +33,16 @@ import {
 
 import { HTTP_METHOD_OPTIONS } from '../config';
 import { normalizeHttpMethod } from '../lib/forms';
-import type { ConvertForm, MockRoute, ProfileKind, RouteForm, RouteProfile, RouteStatus, ScenarioKind } from '../types';
+import type {
+  ConvertForm,
+  MockRoute,
+  ProfileKind,
+  ProxyUrlMode,
+  RouteForm,
+  RouteProfile,
+  RouteStatus,
+  ScenarioKind
+} from '../types';
 
 export function RouteSettingsDialog({
   route,
@@ -177,7 +186,7 @@ export function RouteSettingsDialog({
                     </TableCell>
                     <TableCell className="bodyCell">
                       {profile.profile_kind === 'dynamic'
-                        ? profile.proxy_url
+                        ? `${profile.proxy_url_mode}: ${profile.proxy_url}`
                         : `${profile.status_code} ${profile.response_body ?? ''}`}
                     </TableCell>
                     <TableCell align="right">{profile.delay_ms}</TableCell>
@@ -245,12 +254,28 @@ export function RouteSettingsDialog({
               />
             </Stack>
             {profileForm.profileKind === 'dynamic' ? (
-              <TextField
-                label="Proxy URL"
-                value={profileForm.proxyUrl}
-                onChange={(event) => onProfileFormChange({ ...profileForm, proxyUrl: event.target.value })}
-                fullWidth
-              />
+              <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+                <FormControl fullWidth>
+                  <InputLabel id="settings-proxy-url-mode-label">URL mode</InputLabel>
+                  <Select
+                    labelId="settings-proxy-url-mode-label"
+                    label="URL mode"
+                    value={profileForm.proxyUrlMode}
+                    onChange={(event) =>
+                      onProfileFormChange({ ...profileForm, proxyUrlMode: event.target.value as ProxyUrlMode })
+                    }
+                  >
+                    <MenuItem value="prefix">prefix</MenuItem>
+                    <MenuItem value="static">static</MenuItem>
+                  </Select>
+                </FormControl>
+                <TextField
+                  label="Proxy URL"
+                  value={profileForm.proxyUrl}
+                  onChange={(event) => onProfileFormChange({ ...profileForm, proxyUrl: event.target.value })}
+                  fullWidth
+                />
+              </Stack>
             ) : (
               <>
                 <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>

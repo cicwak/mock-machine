@@ -18,7 +18,8 @@ use uuid::Uuid;
 use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, CreateProject, CreateScenario,
-        ProfileKind, RouteStatus, ScenarioKind, UnknownRequest, UnknownRequestStatus, UpsertRoute,
+        ProfileKind, ProxyUrlMode, RouteStatus, ScenarioKind, UnknownRequest, UnknownRequestStatus,
+        UpdateProjectSettings, UpsertRoute,
     },
     repository::RepositoryError,
     state::AppState,
@@ -39,6 +40,13 @@ struct ProjectQuery {
 #[derive(Debug, Deserialize)]
 struct CreateProjectPayload {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateProjectSettingsPayload {
+    #[serde(default)]
+    default_proxy_enabled: bool,
+    default_proxy_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +75,8 @@ struct ConvertScenarioPayload {
     #[serde(default = "default_scenario_kind")]
     kind: ScenarioKind,
     proxy_url: Option<String>,
+    #[serde(default)]
+    proxy_url_mode: ProxyUrlMode,
     #[serde(default = "default_status_code")]
     status_code: i32,
     #[serde(default = "default_response_headers")]
@@ -85,6 +95,7 @@ impl Default for ConvertScenarioPayload {
             profile_kind: default_profile_kind(),
             kind: default_scenario_kind(),
             proxy_url: None,
+            proxy_url_mode: ProxyUrlMode::Prefix,
             status_code: default_status_code(),
             response_headers: default_response_headers(),
             response_body: None,
@@ -117,6 +128,13 @@ struct UnknownRequestResponse {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+struct UpstreamStaticResponse {
+    status: StatusCode,
+    headers: Value,
+    body: String,
+    bytes: Bytes,
 }
 
 #[derive(Debug)]
@@ -167,6 +185,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/mockadminapi/projects/{id}/active",
             put(set_active_project),
+        )
+        .route(
+            "/mockadminapi/projects/{id}/settings",
+            put(update_project_settings),
         )
         .route("/mockadminapi/projects/{id}/key", put(rotate_project_key))
         .route("/mockadminapi/routes", get(list_routes).post(create_route))
@@ -234,6 +256,27 @@ async fn set_active_project(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, AppError> {
     let project = set_active_project_id(&state, id).await?;
+    Ok(Json(json!(project)))
+}
+
+async fn update_project_settings(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpdateProjectSettingsPayload>,
+) -> Result<Json<Value>, AppError> {
+    let default_proxy_url = payload
+        .default_proxy_url
+        .and_then(|value| (!value.trim().is_empty()).then(|| value.trim().to_string()));
+    let project = state
+        .projects
+        .update_project_settings(
+            id,
+            UpdateProjectSettings {
+                default_proxy_enabled: payload.default_proxy_enabled,
+                default_proxy_url,
+            },
+        )
+        .await?;
     Ok(Json(json!(project)))
 }
 
@@ -462,7 +505,107 @@ async fn mock_fallback(
         "captured unknown mock request"
     );
 
+    let Some(project) = state.projects.get_project(project_id).await? else {
+        return Err(AppError::NotFound("project not found".to_string()));
+    };
+
+    if project.default_proxy_enabled
+        && let Some(default_proxy_url) = project.default_proxy_url.as_deref()
+        && !default_proxy_url.trim().is_empty()
+    {
+        match fetch_default_proxy_response(default_proxy_url, method, uri, headers, body).await {
+            Ok(upstream) => {
+                let conversion = ConvertUnknownRequest {
+                    name: None,
+                    tags: vec!["auto-captured".to_string()],
+                    scenario: CreateScenario {
+                        name: "captured response".to_string(),
+                        profile_kind: ProfileKind::Static,
+                        kind: ScenarioKind::Success,
+                        proxy_url: None,
+                        proxy_url_mode: ProxyUrlMode::Static,
+                        status_code: upstream.status.as_u16() as i32,
+                        response_headers: upstream.headers.clone(),
+                        response_body: Some(upstream.body.clone()),
+                        delay_ms: 0,
+                        selection_rules: json!({}),
+                    },
+                    additional_scenarios: vec![CreateScenario {
+                        name: "default upstream".to_string(),
+                        profile_kind: ProfileKind::Dynamic,
+                        kind: ScenarioKind::Success,
+                        proxy_url: Some(default_proxy_url.to_string()),
+                        proxy_url_mode: ProxyUrlMode::Prefix,
+                        status_code: 200,
+                        response_headers: json!({}),
+                        response_body: None,
+                        delay_ms: 0,
+                        selection_rules: json!({}),
+                    }],
+                };
+
+                match state
+                    .routes
+                    .convert_unknown_request(project_id, saved.id, conversion)
+                    .await
+                {
+                    Ok(converted) => {
+                        info!(
+                            route_id = %converted.route.id,
+                            unknown_request_id = %saved.id,
+                            "auto-converted unknown request from default upstream response"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            unknown_request_id = %saved.id,
+                            "failed to auto-convert unknown request from default upstream response"
+                        );
+                    }
+                }
+
+                return upstream.into_response();
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    project_id = %project.id,
+                    default_proxy_url,
+                    "default upstream request failed"
+                );
+            }
+        }
+    }
+
     Ok((StatusCode::NOT_FOUND, "route is not configured").into_response())
+}
+
+impl UpstreamStaticResponse {
+    fn into_response(self) -> Result<Response, AppError> {
+        let mut builder = Response::builder().status(self.status);
+        if let Some(headers) = self.headers.as_object() {
+            for (name, value) in headers {
+                let Some(value) = value.as_str() else {
+                    continue;
+                };
+
+                let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+                    continue;
+                };
+
+                let Ok(header_value) = HeaderValue::from_str(value) else {
+                    continue;
+                };
+
+                builder = builder.header(header_name, header_value);
+            }
+        }
+
+        builder
+            .body(Body::from(self.bytes))
+            .map_err(|error| AppError::Internal(error.into()))
+    }
 }
 
 async fn render_mock_response(
@@ -479,7 +622,15 @@ async fn render_mock_response(
     }
 
     if scenario.profile_kind == ProfileKind::Dynamic {
-        return proxy_dynamic_response(scenario.proxy_url, method, uri, headers, body).await;
+        return proxy_dynamic_response(
+            scenario.proxy_url,
+            scenario.proxy_url_mode,
+            method,
+            uri,
+            headers,
+            body,
+        )
+        .await;
     }
 
     if scenario.kind == ScenarioKind::Timeout {
@@ -521,6 +672,7 @@ async fn render_mock_response(
 
 async fn proxy_dynamic_response(
     proxy_url: Option<String>,
+    proxy_url_mode: ProxyUrlMode,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -529,7 +681,7 @@ async fn proxy_dynamic_response(
     let proxy_url = proxy_url.ok_or_else(|| {
         AppError::BadRequest("dynamic profile proxy_url is not configured".to_string())
     })?;
-    let target = build_proxy_url(&proxy_url, &uri)?;
+    let target = build_dynamic_proxy_url(&proxy_url, proxy_url_mode, &uri)?;
     let client = reqwest::Client::new();
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|error| AppError::Internal(error.into()))?;
@@ -567,6 +719,43 @@ async fn proxy_dynamic_response(
         .map_err(|error| AppError::Internal(error.into()))
 }
 
+async fn fetch_default_proxy_response(
+    proxy_url: &str,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> anyhow::Result<UpstreamStaticResponse> {
+    let target = build_proxy_url(proxy_url, &uri).map_err(|error| match error {
+        AppError::BadRequest(message) => anyhow::anyhow!(message),
+        AppError::Internal(error) => error,
+        other => anyhow::anyhow!("{other:?}"),
+    })?;
+    let client = reqwest::Client::new();
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
+    let mut request = client.request(reqwest_method, target).body(body.to_vec());
+
+    for (name, value) in &headers {
+        if name == axum::http::header::HOST {
+            continue;
+        }
+        request = request.header(name.as_str(), value.as_bytes());
+    }
+
+    let upstream = request.send().await?;
+    let status = StatusCode::from_u16(upstream.status().as_u16())?;
+    let headers = response_headers_to_json(upstream.headers());
+    let bytes = upstream.bytes().await?;
+    let body = String::from_utf8_lossy(&bytes).to_string();
+
+    Ok(UpstreamStaticResponse {
+        status,
+        headers,
+        body,
+        bytes,
+    })
+}
+
 fn build_proxy_url(proxy_url: &str, uri: &Uri) -> Result<String, AppError> {
     let mut target = url::Url::parse(proxy_url)
         .map_err(|_| AppError::BadRequest("dynamic profile proxy_url is invalid".to_string()))?;
@@ -582,6 +771,52 @@ fn build_proxy_url(proxy_url: &str, uri: &Uri) -> Result<String, AppError> {
     target.set_path(&joined_path);
     target.set_query(uri.query());
     Ok(target.to_string())
+}
+
+fn build_dynamic_proxy_url(
+    proxy_url: &str,
+    proxy_url_mode: ProxyUrlMode,
+    uri: &Uri,
+) -> Result<String, AppError> {
+    match proxy_url_mode {
+        ProxyUrlMode::Static => url::Url::parse(proxy_url)
+            .map(|target| target.to_string())
+            .map_err(|_| AppError::BadRequest("dynamic profile proxy_url is invalid".to_string())),
+        ProxyUrlMode::Prefix => build_proxy_url(proxy_url, uri),
+    }
+}
+
+fn response_headers_to_json(headers: &reqwest::header::HeaderMap) -> Value {
+    let mut result = Map::new();
+
+    for (name, value) in headers {
+        if should_skip_stored_response_header(name.as_str()) {
+            continue;
+        }
+        let Ok(value) = value.to_str() else {
+            warn!(%name, "skipping non-utf8 upstream response header");
+            continue;
+        };
+
+        result.insert(name.as_str().to_string(), Value::String(value.to_string()));
+    }
+
+    Value::Object(result)
+}
+
+fn should_skip_stored_response_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "content-length"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 fn query_to_json(query: Option<&str>) -> Value {
@@ -708,12 +943,14 @@ impl From<ConvertUnknownRequestPayload> for ConvertUnknownRequest {
                 profile_kind: value.scenario.profile_kind,
                 kind: value.scenario.kind,
                 proxy_url: value.scenario.proxy_url,
+                proxy_url_mode: value.scenario.proxy_url_mode,
                 status_code: value.scenario.status_code,
                 response_headers: value.scenario.response_headers,
                 response_body: value.scenario.response_body,
                 delay_ms: value.scenario.delay_ms,
                 selection_rules: value.scenario.selection_rules,
             },
+            additional_scenarios: vec![],
         }
     }
 }
@@ -725,6 +962,7 @@ impl From<ConvertScenarioPayload> for CreateScenario {
             profile_kind: value.profile_kind,
             kind: value.kind,
             proxy_url: value.proxy_url,
+            proxy_url_mode: value.proxy_url_mode,
             status_code: value.status_code,
             response_headers: value.response_headers,
             response_body: value.response_body,

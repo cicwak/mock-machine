@@ -9,6 +9,8 @@ pub struct Model {
     pub id: Uuid,
     pub name: String,
     pub key: String,
+    pub default_proxy_enabled: bool,
+    pub default_proxy_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

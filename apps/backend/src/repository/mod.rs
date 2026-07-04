@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::domain::{
     ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
     CreateProject, MockRoute, ObjectAsset, Project, ResponseScenario, UnknownRequest,
-    UnknownRequestStatus, UpsertRoute,
+    UnknownRequestStatus, UpdateProjectSettings, UpsertRoute,
 };
 
 pub mod cached;
@@ -50,6 +50,12 @@ pub trait ProjectRepository: Send + Sync {
     async fn get_project_by_key(&self, key: &str) -> RepositoryResult<Option<Project>>;
 
     async fn create_project(&self, request: CreateProject) -> RepositoryResult<Project>;
+
+    async fn update_project_settings(
+        &self,
+        id: Uuid,
+        request: UpdateProjectSettings,
+    ) -> RepositoryResult<Project>;
 
     async fn rotate_project_key(&self, id: Uuid) -> RepositoryResult<Project>;
 }

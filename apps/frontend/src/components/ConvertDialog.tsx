@@ -17,7 +17,7 @@ import {
   Typography
 } from '@mui/material';
 
-import type { ConvertForm, ProfileKind, ScenarioKind, UnknownRequest } from '../types';
+import type { ConvertForm, ProfileKind, ProxyUrlMode, ScenarioKind, UnknownRequest } from '../types';
 
 export function ConvertDialog({
   request,
@@ -104,12 +104,26 @@ export function ConvertDialog({
           </Stack>
 
           {form.profileKind === 'dynamic' && (
-            <TextField
-              label="Proxy URL"
-              value={form.proxyUrl}
-              onChange={(event) => onChange({ ...form, proxyUrl: event.target.value })}
-              fullWidth
-            />
+            <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+              <FormControl fullWidth>
+                <InputLabel id="convert-proxy-url-mode-label">URL mode</InputLabel>
+                <Select
+                  labelId="convert-proxy-url-mode-label"
+                  label="URL mode"
+                  value={form.proxyUrlMode}
+                  onChange={(event) => onChange({ ...form, proxyUrlMode: event.target.value as ProxyUrlMode })}
+                >
+                  <MenuItem value="prefix">prefix</MenuItem>
+                  <MenuItem value="static">static</MenuItem>
+                </Select>
+              </FormControl>
+              <TextField
+                label="Proxy URL"
+                value={form.proxyUrl}
+                onChange={(event) => onChange({ ...form, proxyUrl: event.target.value })}
+                fullWidth
+              />
+            </Stack>
           )}
 
           {form.profileKind === 'static' && (
