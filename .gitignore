@@ -44,3 +44,5 @@ tmp/
 *.dump
 *.sql.gz
 *.backup
+
+.idea/
