@@ -374,6 +374,7 @@ async fn mock_fallback(
     };
 
     let saved = state.unknown_requests.capture(captured).await?;
+    state.realtime.unknown_request_captured(saved.clone()).await;
     info!(
         id = %saved.id,
         method = %saved.method,

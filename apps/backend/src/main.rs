@@ -10,10 +10,12 @@ mod domain;
 mod entities;
 mod http;
 mod migrations;
+mod realtime;
 mod repository;
 mod state;
 
 use config::{AppConfig, StorageMode};
+use realtime::{RealtimeNotifier, SocketIoNotifier, register_admin_namespace};
 use repository::{
     cached::CachedRouteRepository, in_memory::InMemoryRepository,
     minio::MinioObjectAssetRepository, postgres::PostgresRepository, redis::RedisRepository,
@@ -35,10 +37,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .with_context(|| format!("invalid BIND_ADDR: {}", config.bind_addr))?;
 
-    let app_state = build_state(&config).await?;
-    let app = http::router(app_state)
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+    let app = build_app(&config).await?;
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -52,7 +51,43 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn build_state(config: &AppConfig) -> anyhow::Result<AppState> {
+async fn build_app(config: &AppConfig) -> anyhow::Result<axum::Router> {
+    if let Some(redis_url) = config.redis_url.as_ref() {
+        let redis_url = socket_io_redis_url(redis_url);
+        let client = redis::Client::open(redis_url).context("invalid REDIS_URL")?;
+        let adapter = socketioxide_redis::RedisAdapterCtr::new_with_redis(&client)
+            .await
+            .context("failed to build Socket.IO Redis adapter")?;
+        let (socket_layer, io) = socketioxide::SocketIo::builder()
+            .with_adapter::<socketioxide_redis::RedisAdapter<_>>(adapter)
+            .build_layer();
+        register_admin_namespace(&io)
+            .await
+            .context("failed to initialize Socket.IO Redis namespace")?;
+        let realtime = Arc::new(SocketIoNotifier::new(io));
+        let state = build_state(config, realtime).await?;
+
+        Ok(http::router(state)
+            .layer(CorsLayer::permissive())
+            .layer(TraceLayer::new_for_http())
+            .layer(socket_layer))
+    } else {
+        let (socket_layer, io) = socketioxide::SocketIo::new_layer();
+        register_admin_namespace(&io);
+        let realtime = Arc::new(SocketIoNotifier::new(io));
+        let state = build_state(config, realtime).await?;
+
+        Ok(http::router(state)
+            .layer(CorsLayer::permissive())
+            .layer(TraceLayer::new_for_http())
+            .layer(socket_layer))
+    }
+}
+
+async fn build_state(
+    config: &AppConfig,
+    realtime: Arc<dyn RealtimeNotifier>,
+) -> anyhow::Result<AppState> {
     match config.storage_mode {
         StorageMode::Postgres => {
             let database_url = config
@@ -82,6 +117,7 @@ async fn build_state(config: &AppConfig) -> anyhow::Result<AppState> {
                 unknown_requests: postgres.clone(),
                 routes,
                 assets,
+                realtime,
                 storage: if config.redis_url.is_some() {
                     "postgres+redis-cache"
                 } else {
@@ -100,9 +136,21 @@ async fn build_state(config: &AppConfig) -> anyhow::Result<AppState> {
                 unknown_requests: memory.clone(),
                 routes: memory.clone(),
                 assets: memory,
+                realtime,
                 storage: "in_memory",
             })
         }
+    }
+}
+
+fn socket_io_redis_url(redis_url: &str) -> String {
+    let lower = redis_url.to_ascii_lowercase();
+    if lower.contains("protocol=") {
+        redis_url.to_string()
+    } else if redis_url.contains('?') {
+        format!("{redis_url}&protocol=resp3")
+    } else {
+        format!("{redis_url}?protocol=resp3")
     }
 }
 

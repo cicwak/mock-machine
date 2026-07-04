@@ -22,6 +22,8 @@ Set `APP_STORAGE=in_memory` to store mock routes and captured unknown requests i
 
 Open the admin panel at `http://localhost:8088/mockadmin`.
 
+The admin panel connects to Socket.IO at `/socket.io/`. When `REDIS_URL` is configured, the backend uses Socketioxide's Redis pub/sub adapter so realtime unknown-request broadcasts reach clients connected to other backend instances. The adapter requires Redis 7+ with RESP3; the backend appends `protocol=resp3` to `REDIS_URL` for Socket.IO when it is not already present.
+
 Useful endpoints:
 
 - `GET http://localhost:8088/mockadminapi/health` - backend health check.

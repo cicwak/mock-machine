@@ -45,10 +45,13 @@ import {
   Typography
 } from '@mui/material';
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { io } from 'socket.io-client';
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ??
   (import.meta.env.DEV ? 'http://127.0.0.1:8080/mockadminapi' : '/mockadminapi');
+const SOCKET_IO_URL = import.meta.env.VITE_SOCKET_IO_URL ?? socketIoOrigin(API_BASE_URL);
+const UNKNOWN_REQUEST_CAPTURED_EVENT = 'unknown_request:captured';
 
 const HTTP_METHODS = [
   'ACL',
@@ -225,6 +228,7 @@ export default function App() {
   const [form, setForm] = useState<ConvertForm>(emptyForm);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [realtimeConnected, setRealtimeConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -255,6 +259,23 @@ export default function App() {
   useEffect(() => {
     void loadData();
   }, [loadData]);
+
+  useEffect(() => {
+    const socket = io(SOCKET_IO_URL, {
+      path: '/socket.io',
+      transports: ['websocket', 'polling']
+    });
+
+    socket.on('connect', () => setRealtimeConnected(true));
+    socket.on('disconnect', () => setRealtimeConnected(false));
+    socket.on(UNKNOWN_REQUEST_CAPTURED_EVENT, (request: UnknownRequest) => {
+      setUnknownRequests((current) => mergeUnknownRequest(current, request));
+    });
+
+    return () => {
+      socket.disconnect();
+    };
+  }, []);
 
   function openConvertDialog(request: UnknownRequest) {
     setSelected(request);
@@ -411,6 +432,13 @@ export default function App() {
           <Typography variant="h6" component="h1" sx={{ ml: 1.5, fontWeight: 700 }}>
             Mock Machine
           </Typography>
+          <Chip
+            size="small"
+            label={realtimeConnected ? 'Realtime' : 'Offline'}
+            color={realtimeConnected ? 'success' : 'default'}
+            variant={realtimeConnected ? 'filled' : 'outlined'}
+            sx={{ ml: 2 }}
+          />
           <Tooltip title="Refresh">
             <span>
               <IconButton sx={{ ml: 'auto' }} onClick={loadData} disabled={loading}>
@@ -1139,6 +1167,23 @@ function splitTags(value: string): string[] {
 
 function normalizeHttpMethod(value: string): string {
   return value.trim().toUpperCase();
+}
+
+function mergeUnknownRequest(requests: UnknownRequest[], next: UnknownRequest): UnknownRequest[] {
+  const byId = new Map(requests.map((request) => [request.id, request]));
+  byId.set(next.id, next);
+
+  return Array.from(byId.values()).sort(
+    (left, right) => new Date(right.last_seen_at).getTime() - new Date(left.last_seen_at).getTime()
+  );
+}
+
+function socketIoOrigin(apiBaseUrl: string): string {
+  if (apiBaseUrl.startsWith('http://') || apiBaseUrl.startsWith('https://')) {
+    return new URL(apiBaseUrl).origin;
+  }
+
+  return window.location.origin;
 }
 
 function parseJsonObject(value: string, label: string): Record<string, string> {
