@@ -11,12 +11,16 @@ use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
         CreateProject, CreateScenario, MockRoute, ProfileKind, Project, ResponseScenario,
-        ScenarioKind, UnknownRequest, UnknownRequestStatus, UpsertRoute, is_valid_http_method,
+        ScenarioKind, UnknownRequest, UnknownRequestStatus, UpsertRoute,
     },
     entities::{mock_routes, projects, response_scenarios, unknown_requests},
     repository::{
         MockRouteRepository, ProjectRepository, RepositoryError, RepositoryResult,
         UnknownRequestRepository,
+        validation::{
+            normalize_project_key, validate_convert_request, validate_profile_request,
+            validate_project_request, validate_route_request,
+        },
     },
 };
 
@@ -531,75 +535,6 @@ async fn convert_unknown_request_tx(
     })
 }
 
-fn validate_convert_request(request: &ConvertUnknownRequest) -> RepositoryResult<()> {
-    validate_profile_request(&request.scenario)
-}
-
-fn validate_profile_request(request: &CreateScenario) -> RepositoryResult<()> {
-    if request.profile_kind == ProfileKind::Dynamic {
-        let proxy_url = request.proxy_url.as_deref().unwrap_or_default();
-        if !(proxy_url.starts_with("http://") || proxy_url.starts_with("https://")) {
-            return Err(RepositoryError::Validation(
-                "profile.proxy_url must be an http(s) URL for dynamic profiles".to_string(),
-            ));
-        }
-    }
-
-    if !(100..=599).contains(&request.status_code) {
-        return Err(RepositoryError::Validation(
-            "scenario.status_code must be between 100 and 599".to_string(),
-        ));
-    }
-
-    if request.delay_ms < 0 {
-        return Err(RepositoryError::Validation(
-            "scenario.delay_ms must be non-negative".to_string(),
-        ));
-    }
-
-    if !request.response_headers.is_object() {
-        return Err(RepositoryError::Validation(
-            "scenario.response_headers must be a JSON object".to_string(),
-        ));
-    }
-
-    if !request.selection_rules.is_object() {
-        return Err(RepositoryError::Validation(
-            "scenario.selection_rules must be a JSON object".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_route_request(request: &UpsertRoute) -> RepositoryResult<()> {
-    if !is_valid_http_method(&request.method) {
-        return Err(RepositoryError::Validation(
-            "route.method must be a valid HTTP method token".to_string(),
-        ));
-    }
-    if !request.path_pattern.starts_with('/') {
-        return Err(RepositoryError::Validation(
-            "route.path_pattern must start with /".to_string(),
-        ));
-    }
-    if request.path_pattern == "/mockadmin"
-        || request.path_pattern.starts_with("/mockadmin/")
-        || request.path_pattern == "/mockadminapi"
-        || request.path_pattern.starts_with("/mockadminapi/")
-    {
-        return Err(RepositoryError::Validation(
-            "admin paths cannot be used as mock routes".to_string(),
-        ));
-    }
-    if request.name.trim().is_empty() {
-        return Err(RepositoryError::Validation(
-            "route.name cannot be empty".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn unknown_from_row(row: &sea_orm::QueryResult) -> RepositoryResult<UnknownRequest> {
     let status: String = row.try_get("", "status").context("missing status")?;
     Ok(UnknownRequest {
@@ -804,15 +739,6 @@ fn fill_profile_model(model: &mut response_scenarios::ActiveModel, request: Crea
     model.selection_rules = Set(request.selection_rules);
 }
 
-fn validate_project_request(request: &CreateProject) -> RepositoryResult<()> {
-    if request.name.trim().is_empty() {
-        return Err(RepositoryError::Validation(
-            "project.name cannot be empty".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn project_key_candidates() -> impl Iterator<Item = String> {
     (8..=32).flat_map(|length| {
         (0..32).map(move |_| {
@@ -820,29 +746,6 @@ fn project_key_candidates() -> impl Iterator<Item = String> {
             raw[..length].to_string()
         })
     })
-}
-
-fn normalize_project_key(key: &str) -> RepositoryResult<String> {
-    let key = key.trim().to_ascii_lowercase();
-    if is_valid_project_key(&key) {
-        Ok(key)
-    } else {
-        Err(RepositoryError::Validation(
-            "project key must be 3-32 chars and contain only lowercase letters, numbers, and hyphens"
-                .to_string(),
-        ))
-    }
-}
-
-fn is_valid_project_key(key: &str) -> bool {
-    (3..=32).contains(&key.len())
-        && key
-            .bytes()
-            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
-        && key
-            .bytes()
-            .next()
-            .is_some_and(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9'))
 }
 
 fn is_project_key_conflict(error: &sea_orm::DbErr) -> bool {

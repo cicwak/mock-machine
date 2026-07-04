@@ -13,6 +13,7 @@ pub mod in_memory;
 pub mod minio;
 pub mod postgres;
 pub mod redis;
+mod validation;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryError {
