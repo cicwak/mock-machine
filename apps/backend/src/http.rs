@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, CreateScenario, ProfileKind,
-        RouteStatus, ScenarioKind, UnknownRequest, UnknownRequestStatus, UpsertRoute,
+        ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, CreateProject, CreateScenario,
+        ProfileKind, RouteStatus, ScenarioKind, UnknownRequest, UnknownRequestStatus, UpsertRoute,
     },
     repository::RepositoryError,
     state::AppState,
@@ -32,7 +32,18 @@ struct HealthResponse<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+struct ProjectQuery {
+    project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateProjectPayload {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ListUnknownRequestsQuery {
+    project_id: Option<Uuid>,
     status: Option<UnknownRequestStatus>,
     #[serde(default = "default_unknown_limit")]
     limit: u64,
@@ -149,6 +160,15 @@ impl From<RepositoryError> for AppError {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/mockadminapi/health", get(health))
+        .route(
+            "/mockadminapi/projects",
+            get(list_projects).post(create_project),
+        )
+        .route(
+            "/mockadminapi/projects/{id}/active",
+            put(set_active_project),
+        )
+        .route("/mockadminapi/projects/{id}/key", put(rotate_project_key))
         .route("/mockadminapi/routes", get(list_routes).post(create_route))
         .route(
             "/mockadminapi/routes/{id}",
@@ -188,8 +208,49 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse<'static>> 
     })
 }
 
-async fn list_routes(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let routes = state.routes.list_routes().await?;
+async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let projects = state.projects.list_projects().await?;
+    let active_project_id = active_project_id(&state).await?;
+    Ok(Json(json!({
+        "items": projects,
+        "active_project_id": active_project_id
+    })))
+}
+
+async fn create_project(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateProjectPayload>,
+) -> Result<Json<Value>, AppError> {
+    let project = state
+        .projects
+        .create_project(CreateProject { name: payload.name })
+        .await?;
+    set_active_project_id(&state, project.id).await?;
+    Ok(Json(json!(project)))
+}
+
+async fn set_active_project(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let project = set_active_project_id(&state, id).await?;
+    Ok(Json(json!(project)))
+}
+
+async fn rotate_project_key(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let project = state.projects.rotate_project_key(id).await?;
+    Ok(Json(json!(project)))
+}
+
+async fn list_routes(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
+) -> Result<Json<Value>, AppError> {
+    let project_id = selected_project_id(&state, query.project_id).await?;
+    let routes = state.routes.list_routes(project_id).await?;
     Ok(Json(json!({ "items": routes })))
 }
 
@@ -207,18 +268,28 @@ async fn get_route(
 
 async fn create_route(
     State(state): State<AppState>,
+    Query(query): Query<ProjectQuery>,
     Json(payload): Json<RoutePayload>,
 ) -> Result<Json<Value>, AppError> {
-    let route = state.routes.upsert_route(None, payload.into()).await?;
+    let project_id = selected_project_id(&state, query.project_id).await?;
+    let route = state
+        .routes
+        .upsert_route(project_id, None, payload.into())
+        .await?;
     Ok(Json(json!(route)))
 }
 
 async fn update_route(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<ProjectQuery>,
     Json(payload): Json<RoutePayload>,
 ) -> Result<Json<Value>, AppError> {
-    let route = state.routes.upsert_route(Some(id), payload.into()).await?;
+    let project_id = selected_project_id(&state, query.project_id).await?;
+    let route = state
+        .routes
+        .upsert_route(project_id, Some(id), payload.into())
+        .await?;
     Ok(Json(json!(route)))
 }
 
@@ -267,7 +338,11 @@ async fn list_unknown_requests(
     Query(query): Query<ListUnknownRequestsQuery>,
 ) -> Result<Json<Value>, AppError> {
     let limit = query.limit.clamp(1, 200);
-    let requests = state.unknown_requests.list(query.status, limit).await?;
+    let project_id = selected_project_id(&state, query.project_id).await?;
+    let requests = state
+        .unknown_requests
+        .list(project_id, query.status, limit)
+        .await?;
     let items = requests
         .into_iter()
         .map(UnknownRequestResponse::from)
@@ -292,11 +367,13 @@ async fn get_unknown_request(
 async fn convert_unknown_request(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    Query(query): Query<ProjectQuery>,
     Json(payload): Json<ConvertUnknownRequestPayload>,
 ) -> Result<Json<Value>, AppError> {
+    let project_id = selected_project_id(&state, query.project_id).await?;
     let converted = state
         .routes
-        .convert_unknown_request(id, payload.into())
+        .convert_unknown_request(project_id, id, payload.into())
         .await?;
 
     Ok(Json(json!(converted)))
@@ -357,9 +434,11 @@ async fn mock_fallback(
         ));
     }
 
+    let project_id = mock_project_id(&state, &headers).await?;
+
     if let Some(active_response) = state
         .routes
-        .find_active_response(method.as_str(), path)
+        .find_active_response(project_id, method.as_str(), path)
         .await?
     {
         return render_mock_response(active_response, method, uri, headers, body).await;
@@ -373,7 +452,7 @@ async fn mock_fallback(
         body: (!body.is_empty()).then(|| body.to_vec()),
     };
 
-    let saved = state.unknown_requests.capture(captured).await?;
+    let saved = state.unknown_requests.capture(project_id, captured).await?;
     state.realtime.unknown_request_captured(saved.clone()).await;
     info!(
         id = %saved.id,
@@ -528,6 +607,61 @@ fn headers_to_json(headers: &HeaderMap) -> Value {
     }
 
     Value::Object(result)
+}
+
+async fn selected_project_id(state: &AppState, project_id: Option<Uuid>) -> Result<Uuid, AppError> {
+    match project_id {
+        Some(project_id) => {
+            set_active_project_id(state, project_id).await?;
+            Ok(project_id)
+        }
+        None => active_project_id(state).await,
+    }
+}
+
+async fn active_project_id(state: &AppState) -> Result<Uuid, AppError> {
+    if let Some(project_id) = *state.active_project_id.read().await {
+        return Ok(project_id);
+    }
+
+    let projects = state.projects.list_projects().await?;
+    let project = projects
+        .first()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("no projects are available")))?;
+    set_active_project_id(state, project.id).await?;
+    Ok(project.id)
+}
+
+async fn mock_project_id(state: &AppState, headers: &HeaderMap) -> Result<Uuid, AppError> {
+    let Some(project_key) = headers
+        .get("x-mock-project")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return active_project_id(state).await;
+    };
+
+    let project = state
+        .projects
+        .get_project_by_key(project_key)
+        .await?
+        .ok_or_else(|| AppError::NotFound("project key not found".to_string()))?;
+
+    Ok(project.id)
+}
+
+async fn set_active_project_id(
+    state: &AppState,
+    project_id: Uuid,
+) -> Result<crate::domain::Project, AppError> {
+    let project = state
+        .projects
+        .get_project(project_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound("project not found".to_string()))?;
+    *state.active_project_id.write().await = Some(project_id);
+    Ok(project)
 }
 
 fn default_unknown_limit() -> u64 {

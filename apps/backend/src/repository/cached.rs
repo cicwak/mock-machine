@@ -53,7 +53,11 @@ impl CachedRouteRepository {
     async fn invalidate_route(&self, route: &MockRoute) -> RepositoryResult<()> {
         let mut conn = self.conn().await?;
         let _: () = conn
-            .del(active_response_key(&route.method, &route.path_pattern))
+            .del(active_response_key(
+                route.project_id,
+                &route.method,
+                &route.path_pattern,
+            ))
             .await?;
         Ok(())
     }
@@ -61,8 +65,8 @@ impl CachedRouteRepository {
 
 #[async_trait::async_trait]
 impl MockRouteRepository for CachedRouteRepository {
-    async fn list_routes(&self) -> RepositoryResult<Vec<MockRoute>> {
-        self.primary.list_routes().await
+    async fn list_routes(&self, project_id: Uuid) -> RepositoryResult<Vec<MockRoute>> {
+        self.primary.list_routes(project_id).await
     }
 
     async fn get_route(&self, id: Uuid) -> RepositoryResult<Option<MockRoute>> {
@@ -71,6 +75,7 @@ impl MockRouteRepository for CachedRouteRepository {
 
     async fn upsert_route(
         &self,
+        project_id: Uuid,
         id: Option<Uuid>,
         request: UpsertRoute,
     ) -> RepositoryResult<MockRoute> {
@@ -81,7 +86,7 @@ impl MockRouteRepository for CachedRouteRepository {
         if let Some(route) = &old_route {
             self.invalidate_route(route).await?;
         }
-        let route = self.primary.upsert_route(id, request).await?;
+        let route = self.primary.upsert_route(project_id, id, request).await?;
         self.invalidate_route(&route).await?;
         Ok(route)
     }
@@ -129,10 +134,11 @@ impl MockRouteRepository for CachedRouteRepository {
 
     async fn find_active_response(
         &self,
+        project_id: Uuid,
         method: &str,
         path: &str,
     ) -> RepositoryResult<Option<ActiveMockResponse>> {
-        let key = active_response_key(&method.to_uppercase(), path);
+        let key = active_response_key(project_id, &method.to_uppercase(), path);
         let mut conn = self.conn().await?;
         if let Some(json) = conn.get::<_, Option<String>>(&key).await? {
             let cached =
@@ -140,7 +146,10 @@ impl MockRouteRepository for CachedRouteRepository {
             return Ok(Some(cached));
         }
 
-        let response = self.primary.find_active_response(method, path).await?;
+        let response = self
+            .primary
+            .find_active_response(project_id, method, path)
+            .await?;
         if let Some(response) = &response {
             let _: () = conn
                 .set_ex(&key, serde_json::to_string(response)?, self.ttl_seconds)
@@ -151,18 +160,22 @@ impl MockRouteRepository for CachedRouteRepository {
 
     async fn convert_unknown_request(
         &self,
+        project_id: Uuid,
         id: Uuid,
         request: ConvertUnknownRequest,
     ) -> RepositoryResult<ConvertedUnknownRequest> {
-        let converted = self.primary.convert_unknown_request(id, request).await?;
+        let converted = self
+            .primary
+            .convert_unknown_request(project_id, id, request)
+            .await?;
         self.invalidate_route(&converted.route).await?;
         Ok(converted)
     }
 }
 
-fn active_response_key(method: &str, path: &str) -> String {
+fn active_response_key(project_id: Uuid, method: &str, path: &str) -> String {
     format!(
-        "mock-machine:route-cache:active:{}:{}",
+        "mock-machine:route-cache:active:{project_id}:{}:{}",
         method.to_uppercase(),
         path
     )

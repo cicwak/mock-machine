@@ -2,6 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::Context;
 use sea_orm::Database;
+use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
@@ -114,10 +115,12 @@ async fn build_state(
             let assets = build_asset_repository(config).await;
 
             Ok(AppState {
+                projects: postgres.clone(),
                 unknown_requests: postgres.clone(),
                 routes,
                 assets,
                 realtime,
+                active_project_id: Arc::new(RwLock::new(None)),
                 storage: if config.redis_url.is_some() {
                     "postgres+redis-cache"
                 } else {
@@ -133,10 +136,12 @@ async fn build_state(
                     .context("failed to connect to Redis")?,
             );
             Ok(AppState {
+                projects: memory.clone(),
                 unknown_requests: memory.clone(),
                 routes: memory.clone(),
                 assets: memory,
                 realtime,
+                active_project_id: Arc::new(RwLock::new(None)),
                 storage: "in_memory",
             })
         }

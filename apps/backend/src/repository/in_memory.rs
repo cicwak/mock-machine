@@ -8,28 +8,157 @@ use uuid::Uuid;
 use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
-        CreateScenario, MockRoute, ObjectAsset, ProfileKind, ResponseScenario, RouteStatus,
-        UnknownRequest, UnknownRequestStatus, UpsertRoute, is_valid_http_method,
+        CreateProject, CreateScenario, MockRoute, ObjectAsset, Project, ResponseScenario,
+        RouteStatus, UnknownRequest, UnknownRequestStatus, UpsertRoute,
     },
     repository::{
-        MockRouteRepository, ObjectAssetRepository, RepositoryError, RepositoryResult,
-        UnknownRequestRepository,
+        MockRouteRepository, ObjectAssetRepository, ProjectRepository, RepositoryError,
+        RepositoryResult, UnknownRequestRepository,
+        validation::{
+            normalize_project_key, validate_convert_request, validate_profile_request,
+            validate_project_request, validate_route_request,
+        },
     },
 };
 
 #[derive(Default)]
 pub struct InMemoryRepository {
+    projects: RwLock<HashMap<Uuid, Project>>,
     unknown: RwLock<HashMap<Uuid, UnknownRequest>>,
-    unknown_index: RwLock<HashMap<(String, String), Uuid>>,
+    unknown_index: RwLock<HashMap<(Uuid, String, String), Uuid>>,
     routes: RwLock<HashMap<Uuid, MockRoute>>,
     scenarios: RwLock<HashMap<Uuid, ResponseScenario>>,
     objects: RwLock<HashMap<String, (Option<String>, Bytes)>>,
 }
 
 #[async_trait::async_trait]
+impl ProjectRepository for InMemoryRepository {
+    async fn list_projects(&self) -> RepositoryResult<Vec<Project>> {
+        self.ensure_default_project().await;
+        let mut projects = self
+            .projects
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        projects.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(projects)
+    }
+
+    async fn get_project(&self, id: Uuid) -> RepositoryResult<Option<Project>> {
+        self.ensure_default_project().await;
+        Ok(self.projects.read().await.get(&id).cloned())
+    }
+
+    async fn get_project_by_key(&self, key: &str) -> RepositoryResult<Option<Project>> {
+        self.ensure_default_project().await;
+        let key = normalize_project_key(key)?;
+        Ok(self
+            .projects
+            .read()
+            .await
+            .values()
+            .find(|project| project.key == key)
+            .cloned())
+    }
+
+    async fn create_project(&self, request: CreateProject) -> RepositoryResult<Project> {
+        validate_project_request(&request)?;
+        let mut projects = self.projects.write().await;
+        if projects
+            .values()
+            .any(|project| project.name.eq_ignore_ascii_case(request.name.trim()))
+        {
+            return Err(RepositoryError::Conflict(
+                "project already exists with this name".to_string(),
+            ));
+        }
+        let now = Utc::now();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: request.name.trim().to_string(),
+            key: generate_project_key(projects.values().map(|project| project.key.as_str())),
+            created_at: now,
+            updated_at: now,
+        };
+        projects.insert(project.id, project.clone());
+        Ok(project)
+    }
+
+    async fn rotate_project_key(&self, id: Uuid) -> RepositoryResult<Project> {
+        self.ensure_default_project().await;
+        let mut projects = self.projects.write().await;
+        let new_key = generate_project_key(
+            projects
+                .values()
+                .filter(|project| project.id != id)
+                .map(|project| project.key.as_str()),
+        );
+        let project = projects.get_mut(&id).ok_or(RepositoryError::NotFound)?;
+        project.key = new_key;
+        project.updated_at = Utc::now();
+        Ok(project.clone())
+    }
+}
+
+impl InMemoryRepository {
+    async fn ensure_default_project(&self) -> Project {
+        if let Some(project) = self
+            .projects
+            .read()
+            .await
+            .values()
+            .find(|project| project.name == "Default")
+            .cloned()
+        {
+            return project;
+        }
+
+        let mut projects = self.projects.write().await;
+        if let Some(project) = projects
+            .values()
+            .find(|project| project.name == "Default")
+            .cloned()
+        {
+            return project;
+        }
+
+        let now = Utc::now();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Default".to_string(),
+            key: "default".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        projects.insert(project.id, project.clone());
+        project
+    }
+
+    async fn ensure_project_exists(&self, project_id: Uuid) -> RepositoryResult<()> {
+        self.ensure_default_project().await;
+        if self.projects.read().await.contains_key(&project_id) {
+            Ok(())
+        } else {
+            Err(RepositoryError::NotFound)
+        }
+    }
+}
+
+#[async_trait::async_trait]
 impl UnknownRequestRepository for InMemoryRepository {
-    async fn capture(&self, request: CapturedRequest) -> RepositoryResult<UnknownRequest> {
-        let key = (request.method.to_uppercase(), request.path.clone());
+    async fn capture(
+        &self,
+        project_id: Uuid,
+        request: CapturedRequest,
+    ) -> RepositoryResult<UnknownRequest> {
+        self.ensure_project_exists(project_id).await?;
+        let key = (
+            project_id,
+            request.method.to_uppercase(),
+            request.path.clone(),
+        );
         let now = Utc::now();
 
         let id = {
@@ -40,8 +169,9 @@ impl UnknownRequestRepository for InMemoryRepository {
         let mut unknown = self.unknown.write().await;
         let entry = unknown.entry(id).or_insert_with(|| UnknownRequest {
             id,
-            method: key.0.clone(),
-            path: key.1.clone(),
+            project_id,
+            method: key.1.clone(),
+            path: key.2.clone(),
             query: request.query.clone(),
             headers: request.headers.clone(),
             body: request.body.clone(),
@@ -66,6 +196,7 @@ impl UnknownRequestRepository for InMemoryRepository {
 
     async fn list(
         &self,
+        project_id: Uuid,
         status: Option<UnknownRequestStatus>,
         limit: u64,
     ) -> RepositoryResult<Vec<UnknownRequest>> {
@@ -75,9 +206,10 @@ impl UnknownRequestRepository for InMemoryRepository {
             .await
             .values()
             .filter(|request| {
-                status
-                    .as_ref()
-                    .is_none_or(|expected| request.status == *expected)
+                request.project_id == project_id
+                    && status
+                        .as_ref()
+                        .is_none_or(|expected| request.status == *expected)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -94,12 +226,13 @@ impl UnknownRequestRepository for InMemoryRepository {
 
 #[async_trait::async_trait]
 impl MockRouteRepository for InMemoryRepository {
-    async fn list_routes(&self) -> RepositoryResult<Vec<MockRoute>> {
+    async fn list_routes(&self, project_id: Uuid) -> RepositoryResult<Vec<MockRoute>> {
         let mut routes = self
             .routes
             .read()
             .await
             .values()
+            .filter(|route| route.project_id == project_id)
             .cloned()
             .collect::<Vec<_>>();
         routes.sort_by(|left, right| left.path_pattern.cmp(&right.path_pattern));
@@ -112,10 +245,12 @@ impl MockRouteRepository for InMemoryRepository {
 
     async fn upsert_route(
         &self,
+        project_id: Uuid,
         id: Option<Uuid>,
         request: UpsertRoute,
     ) -> RepositoryResult<MockRoute> {
         validate_route_request(&request)?;
+        self.ensure_project_exists(project_id).await?;
 
         let id = id.unwrap_or_else(Uuid::new_v4);
         let now = Utc::now();
@@ -123,6 +258,7 @@ impl MockRouteRepository for InMemoryRepository {
         let created_at = routes.get(&id).map(|route| route.created_at).unwrap_or(now);
         let route = MockRoute {
             id,
+            project_id,
             method: request.method.to_uppercase(),
             path_pattern: request.path_pattern,
             name: request.name,
@@ -212,6 +348,7 @@ impl MockRouteRepository for InMemoryRepository {
 
     async fn find_active_response(
         &self,
+        project_id: Uuid,
         method: &str,
         path: &str,
     ) -> RepositoryResult<Option<ActiveMockResponse>> {
@@ -221,7 +358,8 @@ impl MockRouteRepository for InMemoryRepository {
             .await
             .values()
             .find(|route| {
-                route.method == method.to_uppercase()
+                route.project_id == project_id
+                    && route.method == method.to_uppercase()
                     && route.path_pattern == path
                     && route.status == RouteStatus::Active
             })
@@ -241,6 +379,7 @@ impl MockRouteRepository for InMemoryRepository {
 
     async fn convert_unknown_request(
         &self,
+        project_id: Uuid,
         id: Uuid,
         request: ConvertUnknownRequest,
     ) -> RepositoryResult<ConvertedUnknownRequest> {
@@ -249,6 +388,7 @@ impl MockRouteRepository for InMemoryRepository {
         let mut unknown_requests = self.unknown.write().await;
         let unknown = unknown_requests
             .get_mut(&id)
+            .filter(|unknown| unknown.project_id == project_id)
             .ok_or(RepositoryError::NotFound)?;
 
         if unknown.status == UnknownRequestStatus::Converted {
@@ -267,12 +407,11 @@ impl MockRouteRepository for InMemoryRepository {
             ));
         }
 
-        let duplicate = self
-            .routes
-            .read()
-            .await
-            .values()
-            .any(|route| route.method == unknown.method && route.path_pattern == unknown.path);
+        let duplicate = self.routes.read().await.values().any(|route| {
+            route.project_id == project_id
+                && route.method == unknown.method
+                && route.path_pattern == unknown.path
+        });
         if duplicate {
             return Err(RepositoryError::Conflict(
                 "route already exists for this method and path".to_string(),
@@ -285,6 +424,7 @@ impl MockRouteRepository for InMemoryRepository {
 
         let route = MockRoute {
             id: route_id,
+            project_id,
             method: unknown.method.clone(),
             path_pattern: unknown.path.clone(),
             name: request.name.unwrap_or_else(|| {
@@ -365,71 +505,18 @@ impl ObjectAssetRepository for InMemoryRepository {
     }
 }
 
-fn validate_convert_request(request: &ConvertUnknownRequest) -> RepositoryResult<()> {
-    validate_profile_request(&request.scenario)
-}
+fn generate_project_key<'a>(existing: impl Iterator<Item = &'a str>) -> String {
+    let existing = existing.collect::<std::collections::HashSet<_>>();
 
-fn validate_route_request(request: &UpsertRoute) -> RepositoryResult<()> {
-    if !is_valid_http_method(&request.method) {
-        return Err(RepositoryError::Validation(
-            "route.method must be a valid HTTP method token".to_string(),
-        ));
-    }
-    if !request.path_pattern.starts_with('/') {
-        return Err(RepositoryError::Validation(
-            "route.path_pattern must start with /".to_string(),
-        ));
-    }
-    if request.path_pattern == "/mockadmin"
-        || request.path_pattern.starts_with("/mockadmin/")
-        || request.path_pattern == "/mockadminapi"
-        || request.path_pattern.starts_with("/mockadminapi/")
-    {
-        return Err(RepositoryError::Validation(
-            "admin paths cannot be used as mock routes".to_string(),
-        ));
-    }
-    if request.name.trim().is_empty() {
-        return Err(RepositoryError::Validation(
-            "route.name cannot be empty".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_profile_request(request: &CreateScenario) -> RepositoryResult<()> {
-    if request.profile_kind == ProfileKind::Dynamic {
-        let proxy_url = request.proxy_url.as_deref().unwrap_or_default();
-        if !(proxy_url.starts_with("http://") || proxy_url.starts_with("https://")) {
-            return Err(RepositoryError::Validation(
-                "profile.proxy_url must be an http(s) URL for dynamic profiles".to_string(),
-            ));
+    for length in 8..=32 {
+        for _ in 0..32 {
+            let raw = Uuid::new_v4().simple().to_string();
+            let candidate = raw[..length].to_string();
+            if !existing.contains(candidate.as_str()) {
+                return candidate;
+            }
         }
     }
 
-    if !(100..=599).contains(&request.status_code) {
-        return Err(RepositoryError::Validation(
-            "scenario.status_code must be between 100 and 599".to_string(),
-        ));
-    }
-
-    if request.delay_ms < 0 {
-        return Err(RepositoryError::Validation(
-            "scenario.delay_ms must be non-negative".to_string(),
-        ));
-    }
-
-    if !request.response_headers.is_object() {
-        return Err(RepositoryError::Validation(
-            "scenario.response_headers must be a JSON object".to_string(),
-        ));
-    }
-
-    if !request.selection_rules.is_object() {
-        return Err(RepositoryError::Validation(
-            "scenario.selection_rules must be a JSON object".to_string(),
-        ));
-    }
-
-    Ok(())
+    Uuid::new_v4().simple().to_string()
 }
