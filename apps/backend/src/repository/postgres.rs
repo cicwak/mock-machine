@@ -10,7 +10,7 @@ use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
         CreateScenario, MockRoute, ProfileKind, ResponseScenario, ScenarioKind, UnknownRequest,
-        UnknownRequestStatus, UpsertRoute,
+        UnknownRequestStatus, UpsertRoute, is_valid_http_method,
     },
     entities::{mock_routes, response_scenarios, unknown_requests},
     repository::{
@@ -465,9 +465,9 @@ fn validate_profile_request(request: &CreateScenario) -> RepositoryResult<()> {
 }
 
 fn validate_route_request(request: &UpsertRoute) -> RepositoryResult<()> {
-    if request.method.trim().is_empty() {
+    if !is_valid_http_method(&request.method) {
         return Err(RepositoryError::Validation(
-            "route.method cannot be empty".to_string(),
+            "route.method must be a valid HTTP method token".to_string(),
         ));
     }
     if !request.path_pattern.starts_with('/') {

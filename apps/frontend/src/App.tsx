@@ -12,6 +12,7 @@ import SaveIcon from '@mui/icons-material/Save';
 import SettingsIcon from '@mui/icons-material/Settings';
 import {
   Alert,
+  Autocomplete,
   AppBar,
   Box,
   Button,
@@ -49,10 +50,74 @@ const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ??
   (import.meta.env.DEV ? 'http://127.0.0.1:8080/mockadminapi' : '/mockadminapi');
 
+const HTTP_METHODS = [
+  'ACL',
+  'BASELINE-CONTROL',
+  'BIND',
+  'CHECKIN',
+  'CHECKOUT',
+  'CONNECT',
+  'COPY',
+  'DELETE',
+  'GET',
+  'HEAD',
+  'LABEL',
+  'LINK',
+  'LOCK',
+  'MERGE',
+  'MKACTIVITY',
+  'MKCALENDAR',
+  'MKCOL',
+  'MKREDIRECTREF',
+  'MKWORKSPACE',
+  'MOVE',
+  'OPTIONS',
+  'ORDERPATCH',
+  'PATCH',
+  'POST',
+  'PRI',
+  'PROPFIND',
+  'PROPPATCH',
+  'PUT',
+  'QUERY',
+  'REBIND',
+  'REPORT',
+  'SEARCH',
+  'TRACE',
+  'UNBIND',
+  'UNCHECKOUT',
+  'UNLINK',
+  'UNLOCK',
+  'UPDATE',
+  'UPDATEREDIRECTREF',
+  'VERSION-CONTROL'
+] as const;
+
+const COMMON_HTTP_METHODS = [
+  'CONNECT',
+  'DELETE',
+  'GET',
+  'HEAD',
+  'OPTIONS',
+  'PATCH',
+  'POST',
+  'PUT',
+  'QUERY',
+  'TRACE'
+] as const;
+
+const HTTP_METHOD_OPTIONS = [
+  ...COMMON_HTTP_METHODS.map((method) => ({ method, group: 'Common' })),
+  ...HTTP_METHODS.filter((method) => !COMMON_HTTP_METHODS.includes(method as CommonHttpMethod)).map(
+    (method) => ({ method, group: 'Other' })
+  )
+];
+
 type UnknownRequestStatus = 'new' | 'ignored' | 'converted';
 type ScenarioKind = 'success' | 'error' | 'timeout' | 'custom';
 type RouteStatus = 'active' | 'disabled';
 type ProfileKind = 'static' | 'dynamic';
+type CommonHttpMethod = (typeof COMMON_HTTP_METHODS)[number];
 
 interface UnknownRequest {
   id: string;
@@ -233,7 +298,7 @@ export default function App() {
     setError(null);
     try {
       const route = await apiPut<MockRoute>(`/routes/${editingRoute.id}`, {
-        method: routeForm.method,
+        method: normalizeHttpMethod(routeForm.method),
         path_pattern: routeForm.pathPattern,
         name: routeForm.name,
         tags: splitTags(routeForm.tags),
@@ -782,11 +847,33 @@ function RouteSettingsDialog({
       <DialogContent dividers>
         <Stack spacing={2.5}>
           <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
-            <TextField
-              label="Method"
-              value={routeForm.method}
-              onChange={(event) => onRouteFormChange({ ...routeForm, method: event.target.value })}
+            <Autocomplete
+              freeSolo
               fullWidth
+              selectOnFocus
+              clearOnBlur={false}
+              handleHomeEndKeys
+              options={HTTP_METHOD_OPTIONS}
+              groupBy={(option) => option.group}
+              getOptionLabel={(option) => (typeof option === 'string' ? option : option.method)}
+              value={routeForm.method}
+              inputValue={routeForm.method}
+              onChange={(_, value) =>
+                onRouteFormChange({
+                  ...routeForm,
+                  method: typeof value === 'string' ? value : value?.method ?? ''
+                })
+              }
+              onInputChange={(_, value) => onRouteFormChange({ ...routeForm, method: value })}
+              renderInput={(params) => (
+                <TextField
+                  {...params}
+                  label="Method"
+                  onBlur={() =>
+                    onRouteFormChange({ ...routeForm, method: normalizeHttpMethod(routeForm.method) })
+                  }
+                />
+              )}
             />
             <TextField
               label="Path pattern"
@@ -1048,6 +1135,10 @@ function splitTags(value: string): string[] {
     .split(',')
     .map((tag) => tag.trim())
     .filter(Boolean);
+}
+
+function normalizeHttpMethod(value: string): string {
+  return value.trim().toUpperCase();
 }
 
 function parseJsonObject(value: string, label: string): Record<string, string> {

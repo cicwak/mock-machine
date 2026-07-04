@@ -9,7 +9,7 @@ use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
         CreateScenario, MockRoute, ObjectAsset, ProfileKind, ResponseScenario, RouteStatus,
-        UnknownRequest, UnknownRequestStatus, UpsertRoute,
+        UnknownRequest, UnknownRequestStatus, UpsertRoute, is_valid_http_method,
     },
     repository::{
         MockRouteRepository, ObjectAssetRepository, RepositoryError, RepositoryResult,
@@ -115,6 +115,8 @@ impl MockRouteRepository for InMemoryRepository {
         id: Option<Uuid>,
         request: UpsertRoute,
     ) -> RepositoryResult<MockRoute> {
+        validate_route_request(&request)?;
+
         let id = id.unwrap_or_else(Uuid::new_v4);
         let now = Utc::now();
         let mut routes = self.routes.write().await;
@@ -365,6 +367,34 @@ impl ObjectAssetRepository for InMemoryRepository {
 
 fn validate_convert_request(request: &ConvertUnknownRequest) -> RepositoryResult<()> {
     validate_profile_request(&request.scenario)
+}
+
+fn validate_route_request(request: &UpsertRoute) -> RepositoryResult<()> {
+    if !is_valid_http_method(&request.method) {
+        return Err(RepositoryError::Validation(
+            "route.method must be a valid HTTP method token".to_string(),
+        ));
+    }
+    if !request.path_pattern.starts_with('/') {
+        return Err(RepositoryError::Validation(
+            "route.path_pattern must start with /".to_string(),
+        ));
+    }
+    if request.path_pattern == "/mockadmin"
+        || request.path_pattern.starts_with("/mockadmin/")
+        || request.path_pattern == "/mockadminapi"
+        || request.path_pattern.starts_with("/mockadminapi/")
+    {
+        return Err(RepositoryError::Validation(
+            "admin paths cannot be used as mock routes".to_string(),
+        ));
+    }
+    if request.name.trim().is_empty() {
+        return Err(RepositoryError::Validation(
+            "route.name cannot be empty".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_profile_request(request: &CreateScenario) -> RepositoryResult<()> {
