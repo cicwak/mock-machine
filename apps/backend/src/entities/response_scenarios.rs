@@ -17,6 +17,15 @@ pub enum ScenarioKind {
     Custom,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
+#[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "profile_kind")]
+pub enum ProfileKind {
+    #[sea_orm(string_value = "static")]
+    Static,
+    #[sea_orm(string_value = "dynamic")]
+    Dynamic,
+}
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "response_scenarios")]
 pub struct Model {
@@ -24,7 +33,9 @@ pub struct Model {
     pub id: Uuid,
     pub route_id: Uuid,
     pub name: String,
+    pub profile_kind: ProfileKind,
     pub kind: ScenarioKind,
+    pub proxy_url: Option<String>,
     pub status_code: i32,
     pub response_headers: Value,
     pub response_body: Option<String>,

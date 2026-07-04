@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{OriginalUri, Path, Query, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, CreateScenario, ScenarioKind,
-        UnknownRequest, UnknownRequestStatus,
+        ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, CreateScenario, ProfileKind,
+        RouteStatus, ScenarioKind, UnknownRequest, UnknownRequestStatus, UpsertRoute,
     },
     repository::RepositoryError,
     state::AppState,
@@ -51,8 +51,11 @@ struct ConvertUnknownRequestPayload {
 struct ConvertScenarioPayload {
     #[serde(default = "default_scenario_name")]
     name: String,
+    #[serde(default = "default_profile_kind")]
+    profile_kind: ProfileKind,
     #[serde(default = "default_scenario_kind")]
     kind: ScenarioKind,
+    proxy_url: Option<String>,
     #[serde(default = "default_status_code")]
     status_code: i32,
     #[serde(default = "default_response_headers")]
@@ -68,7 +71,9 @@ impl Default for ConvertScenarioPayload {
     fn default() -> Self {
         Self {
             name: default_scenario_name(),
+            profile_kind: default_profile_kind(),
             kind: default_scenario_kind(),
+            proxy_url: None,
             status_code: default_status_code(),
             response_headers: default_response_headers(),
             response_body: None,
@@ -76,6 +81,18 @@ impl Default for ConvertScenarioPayload {
             selection_rules: default_selection_rules(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutePayload {
+    method: String,
+    path_pattern: String,
+    name: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default = "default_route_status")]
+    status: RouteStatus,
+    active_scenario_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,8 +149,23 @@ impl From<RepositoryError> for AppError {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/mockadminapi/health", get(health))
-        .route("/mockadminapi/routes", get(list_routes))
-        .route("/mockadminapi/routes/{id}", get(get_route))
+        .route("/mockadminapi/routes", get(list_routes).post(create_route))
+        .route(
+            "/mockadminapi/routes/{id}",
+            get(get_route).put(update_route),
+        )
+        .route(
+            "/mockadminapi/routes/{id}/profiles",
+            get(list_profiles).post(create_profile),
+        )
+        .route(
+            "/mockadminapi/routes/{id}/profiles/{profile_id}",
+            put(update_profile),
+        )
+        .route(
+            "/mockadminapi/routes/{id}/active-profile/{profile_id}",
+            put(set_active_profile),
+        )
         .route("/mockadminapi/unknown-requests", get(list_unknown_requests))
         .route(
             "/mockadminapi/unknown-requests/{id}",
@@ -170,6 +202,63 @@ async fn get_route(
         .get_route(id)
         .await?
         .ok_or_else(|| AppError::NotFound("route not found".to_string()))?;
+    Ok(Json(json!(route)))
+}
+
+async fn create_route(
+    State(state): State<AppState>,
+    Json(payload): Json<RoutePayload>,
+) -> Result<Json<Value>, AppError> {
+    let route = state.routes.upsert_route(None, payload.into()).await?;
+    Ok(Json(json!(route)))
+}
+
+async fn update_route(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<RoutePayload>,
+) -> Result<Json<Value>, AppError> {
+    let route = state.routes.upsert_route(Some(id), payload.into()).await?;
+    Ok(Json(json!(route)))
+}
+
+async fn list_profiles(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let profiles = state.routes.list_profiles(id).await?;
+    Ok(Json(json!({ "items": profiles })))
+}
+
+async fn create_profile(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<ConvertScenarioPayload>,
+) -> Result<Json<Value>, AppError> {
+    let profile = state
+        .routes
+        .upsert_profile(id, None, payload.into())
+        .await?;
+    Ok(Json(json!(profile)))
+}
+
+async fn update_profile(
+    State(state): State<AppState>,
+    Path((id, profile_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<ConvertScenarioPayload>,
+) -> Result<Json<Value>, AppError> {
+    let profile = state
+        .routes
+        .upsert_profile(id, Some(profile_id), payload.into())
+        .await?;
+    Ok(Json(json!(profile)))
+}
+
+async fn set_active_profile(
+    State(state): State<AppState>,
+    Path((id, profile_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, AppError> {
+    let route = state.routes.set_active_profile(id, profile_id).await?;
     Ok(Json(json!(route)))
 }
 
@@ -273,7 +362,7 @@ async fn mock_fallback(
         .find_active_response(method.as_str(), path)
         .await?
     {
-        return render_mock_response(active_response).await;
+        return render_mock_response(active_response, method, uri, headers, body).await;
     }
 
     let captured = CapturedRequest {
@@ -296,11 +385,21 @@ async fn mock_fallback(
     Ok((StatusCode::NOT_FOUND, "route is not configured").into_response())
 }
 
-async fn render_mock_response(active_response: ActiveMockResponse) -> Result<Response, AppError> {
+async fn render_mock_response(
+    active_response: ActiveMockResponse,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
     let scenario = active_response.scenario;
 
     if scenario.delay_ms > 0 {
         sleep(Duration::from_millis(scenario.delay_ms as u64)).await;
+    }
+
+    if scenario.profile_kind == ProfileKind::Dynamic {
+        return proxy_dynamic_response(scenario.proxy_url, method, uri, headers, body).await;
     }
 
     if scenario.kind == ScenarioKind::Timeout {
@@ -340,6 +439,71 @@ async fn render_mock_response(active_response: ActiveMockResponse) -> Result<Res
         .map_err(|error| AppError::Internal(error.into()))
 }
 
+async fn proxy_dynamic_response(
+    proxy_url: Option<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    let proxy_url = proxy_url.ok_or_else(|| {
+        AppError::BadRequest("dynamic profile proxy_url is not configured".to_string())
+    })?;
+    let target = build_proxy_url(&proxy_url, &uri)?;
+    let client = reqwest::Client::new();
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .map_err(|error| AppError::Internal(error.into()))?;
+    let mut request = client.request(reqwest_method, target).body(body.to_vec());
+
+    for (name, value) in &headers {
+        if name == axum::http::header::HOST {
+            continue;
+        }
+        request = request.header(name.as_str(), value.as_bytes());
+    }
+
+    let upstream = request
+        .send()
+        .await
+        .map_err(|error| AppError::Internal(error.into()))?;
+    let status = StatusCode::from_u16(upstream.status().as_u16())
+        .map_err(|error| AppError::Internal(error.into()))?;
+    let upstream_headers = upstream.headers().clone();
+    let bytes = upstream
+        .bytes()
+        .await
+        .map_err(|error| AppError::Internal(error.into()))?;
+    let mut builder = Response::builder().status(status);
+
+    for (name, value) in upstream_headers.iter() {
+        if name == reqwest::header::CONTENT_LENGTH {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+
+    builder
+        .body(Body::from(bytes))
+        .map_err(|error| AppError::Internal(error.into()))
+}
+
+fn build_proxy_url(proxy_url: &str, uri: &Uri) -> Result<String, AppError> {
+    let mut target = url::Url::parse(proxy_url)
+        .map_err(|_| AppError::BadRequest("dynamic profile proxy_url is invalid".to_string()))?;
+    let base_path = target.path().trim_end_matches('/');
+    let request_path = uri.path().trim_start_matches('/');
+    let joined_path = if base_path.is_empty() {
+        format!("/{request_path}")
+    } else if request_path.is_empty() {
+        base_path.to_string()
+    } else {
+        format!("{base_path}/{request_path}")
+    };
+    target.set_path(&joined_path);
+    target.set_query(uri.query());
+    Ok(target.to_string())
+}
+
 fn query_to_json(query: Option<&str>) -> Value {
     let mut result = Map::new();
 
@@ -373,8 +537,16 @@ fn default_scenario_name() -> String {
     "success".to_string()
 }
 
+fn default_profile_kind() -> ProfileKind {
+    ProfileKind::Static
+}
+
 fn default_scenario_kind() -> ScenarioKind {
     ScenarioKind::Success
+}
+
+fn default_route_status() -> RouteStatus {
+    RouteStatus::Active
 }
 
 fn default_status_code() -> i32 {
@@ -398,13 +570,44 @@ impl From<ConvertUnknownRequestPayload> for ConvertUnknownRequest {
             tags: value.tags,
             scenario: CreateScenario {
                 name: value.scenario.name,
+                profile_kind: value.scenario.profile_kind,
                 kind: value.scenario.kind,
+                proxy_url: value.scenario.proxy_url,
                 status_code: value.scenario.status_code,
                 response_headers: value.scenario.response_headers,
                 response_body: value.scenario.response_body,
                 delay_ms: value.scenario.delay_ms,
                 selection_rules: value.scenario.selection_rules,
             },
+        }
+    }
+}
+
+impl From<ConvertScenarioPayload> for CreateScenario {
+    fn from(value: ConvertScenarioPayload) -> Self {
+        Self {
+            name: value.name,
+            profile_kind: value.profile_kind,
+            kind: value.kind,
+            proxy_url: value.proxy_url,
+            status_code: value.status_code,
+            response_headers: value.response_headers,
+            response_body: value.response_body,
+            delay_ms: value.delay_ms,
+            selection_rules: value.selection_rules,
+        }
+    }
+}
+
+impl From<RoutePayload> for UpsertRoute {
+    fn from(value: RoutePayload) -> Self {
+        Self {
+            method: value.method,
+            path_pattern: value.path_pattern,
+            name: value.name,
+            tags: value.tags,
+            status: value.status,
+            active_scenario_id: value.active_scenario_id,
         }
     }
 }

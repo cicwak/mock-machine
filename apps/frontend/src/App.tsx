@@ -1,9 +1,12 @@
+import AddIcon from '@mui/icons-material/Add';
 import AutorenewIcon from '@mui/icons-material/Autorenew';
 import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline';
 import CloseIcon from '@mui/icons-material/Close';
+import EditIcon from '@mui/icons-material/Edit';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
 import InboxIcon from '@mui/icons-material/Inbox';
 import LanIcon from '@mui/icons-material/Lan';
+import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import RouteIcon from '@mui/icons-material/Route';
 import SaveIcon from '@mui/icons-material/Save';
 import SettingsIcon from '@mui/icons-material/Settings';
@@ -19,6 +22,7 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  Divider,
   FormControl,
   IconButton,
   InputLabel,
@@ -48,6 +52,7 @@ const API_BASE_URL =
 type UnknownRequestStatus = 'new' | 'ignored' | 'converted';
 type ScenarioKind = 'success' | 'error' | 'timeout' | 'custom';
 type RouteStatus = 'active' | 'disabled';
+type ProfileKind = 'static' | 'dynamic';
 
 interface UnknownRequest {
   id: string;
@@ -76,6 +81,22 @@ interface MockRoute {
   updated_at: string;
 }
 
+interface RouteProfile {
+  id: string;
+  route_id: string;
+  name: string;
+  profile_kind: ProfileKind;
+  kind: ScenarioKind;
+  proxy_url: string | null;
+  status_code: number;
+  response_headers: Record<string, string>;
+  response_body: string | null;
+  delay_ms: number;
+  selection_rules: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
 interface ListResponse<T> {
   items: T[];
 }
@@ -84,7 +105,9 @@ interface ConvertForm {
   name: string;
   tags: string;
   scenarioName: string;
+  profileKind: ProfileKind;
   kind: ScenarioKind;
+  proxyUrl: string;
   statusCode: number;
   responseHeaders: string;
   responseBody: string;
@@ -95,12 +118,22 @@ const emptyForm: ConvertForm = {
   name: '',
   tags: '',
   scenarioName: 'success',
+  profileKind: 'static',
   kind: 'success',
+  proxyUrl: '',
   statusCode: 200,
   responseHeaders: '{\n  "content-type": "application/json"\n}',
   responseBody: '{\n  "ok": true\n}',
   delayMs: 0
 };
+
+interface RouteForm {
+  method: string;
+  pathPattern: string;
+  name: string;
+  tags: string;
+  status: RouteStatus;
+}
 
 const statusColors: Record<UnknownRequestStatus, 'default' | 'success' | 'warning'> = {
   new: 'warning',
@@ -113,6 +146,17 @@ export default function App() {
   const [unknownRequests, setUnknownRequests] = useState<UnknownRequest[]>([]);
   const [routes, setRoutes] = useState<MockRoute[]>([]);
   const [selected, setSelected] = useState<UnknownRequest | null>(null);
+  const [editingRoute, setEditingRoute] = useState<MockRoute | null>(null);
+  const [routeProfiles, setRouteProfiles] = useState<RouteProfile[]>([]);
+  const [routeForm, setRouteForm] = useState<RouteForm>({
+    method: 'GET',
+    pathPattern: '/',
+    name: '',
+    tags: '',
+    status: 'active'
+  });
+  const [profileForm, setProfileForm] = useState<ConvertForm>(emptyForm);
+  const [editingProfileId, setEditingProfileId] = useState<string | null>(null);
   const [form, setForm] = useState<ConvertForm>(emptyForm);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -158,6 +202,115 @@ export default function App() {
     setNotice(null);
   }
 
+  async function openRouteSettings(route: MockRoute) {
+    setEditingRoute(route);
+    setRouteForm({
+      method: route.method,
+      pathPattern: route.path_pattern,
+      name: route.name,
+      tags: route.tags.join(', '),
+      status: route.status
+    });
+    setProfileForm(emptyForm);
+    setEditingProfileId(null);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const response = await apiGet<ListResponse<RouteProfile>>(`/routes/${route.id}/profiles`);
+      setRouteProfiles(response.items);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
+  }
+
+  async function saveRouteSettings() {
+    if (!editingRoute) {
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    try {
+      const route = await apiPut<MockRoute>(`/routes/${editingRoute.id}`, {
+        method: routeForm.method,
+        path_pattern: routeForm.pathPattern,
+        name: routeForm.name,
+        tags: splitTags(routeForm.tags),
+        status: routeForm.status,
+        active_scenario_id: editingRoute.active_scenario_id
+      });
+      setEditingRoute(route);
+      setNotice('Route settings saved');
+      await loadData();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveProfile() {
+    if (!editingRoute) {
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    try {
+      const payload = profilePayload(profileForm);
+      if (editingProfileId) {
+        await apiPut(`/routes/${editingRoute.id}/profiles/${editingProfileId}`, payload);
+      } else {
+        await apiPost(`/routes/${editingRoute.id}/profiles`, payload);
+      }
+      const response = await apiGet<ListResponse<RouteProfile>>(`/routes/${editingRoute.id}/profiles`);
+      setRouteProfiles(response.items);
+      setProfileForm(emptyForm);
+      setEditingProfileId(null);
+      setNotice('Profile saved');
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function activateProfile(profileId: string) {
+    if (!editingRoute) {
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    try {
+      const route = await apiPut<MockRoute>(`/routes/${editingRoute.id}/active-profile/${profileId}`, {});
+      setEditingRoute(route);
+      setNotice('Active profile switched');
+      await loadData();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function editProfile(profile: RouteProfile) {
+    setEditingProfileId(profile.id);
+    setProfileForm({
+      name: '',
+      tags: '',
+      scenarioName: profile.name,
+      profileKind: profile.profile_kind,
+      kind: profile.kind,
+      proxyUrl: profile.proxy_url ?? '',
+      statusCode: profile.status_code,
+      responseHeaders: JSON.stringify(profile.response_headers, null, 2),
+      responseBody: profile.response_body ?? '',
+      delayMs: profile.delay_ms
+    });
+  }
+
   async function convertSelected() {
     if (!selected) {
       return;
@@ -170,19 +323,8 @@ export default function App() {
       const responseHeaders = parseJsonObject(form.responseHeaders, 'Response headers');
       await apiPost(`/unknown-requests/${selected.id}/convert`, {
         name: form.name || undefined,
-        tags: form.tags
-          .split(',')
-          .map((tag) => tag.trim())
-          .filter(Boolean),
-        scenario: {
-          name: form.scenarioName,
-          kind: form.kind,
-          status_code: form.statusCode,
-          response_headers: responseHeaders,
-          response_body: form.responseBody,
-          delay_ms: form.delayMs,
-          selection_rules: {}
-        }
+        tags: splitTags(form.tags),
+        scenario: profilePayload({ ...form, responseHeaders: JSON.stringify(responseHeaders, null, 2) })
       });
 
       setSelected(null);
@@ -254,7 +396,7 @@ export default function App() {
                 onConvert={openConvertDialog}
               />
             ) : (
-              <RoutesTable routes={routes} loading={loading} />
+              <RoutesTable routes={routes} loading={loading} onEdit={openRouteSettings} />
             )}
           </Paper>
         </Stack>
@@ -267,6 +409,21 @@ export default function App() {
         onChange={setForm}
         onClose={() => setSelected(null)}
         onSave={convertSelected}
+      />
+      <RouteSettingsDialog
+        route={editingRoute}
+        profiles={routeProfiles}
+        routeForm={routeForm}
+        profileForm={profileForm}
+        editingProfileId={editingProfileId}
+        saving={saving}
+        onRouteFormChange={setRouteForm}
+        onProfileFormChange={setProfileForm}
+        onClose={() => setEditingRoute(null)}
+        onSaveRoute={saveRouteSettings}
+        onSaveProfile={saveProfile}
+        onEditProfile={editProfile}
+        onActivateProfile={activateProfile}
       />
     </Box>
   );
@@ -350,7 +507,15 @@ function UnknownRequestsTable({
   );
 }
 
-function RoutesTable({ routes, loading }: { routes: MockRoute[]; loading: boolean }) {
+function RoutesTable({
+  routes,
+  loading,
+  onEdit
+}: {
+  routes: MockRoute[];
+  loading: boolean;
+  onEdit: (route: MockRoute) => void;
+}) {
   return (
     <TableContainer>
       <Table size="small" stickyHeader>
@@ -362,6 +527,7 @@ function RoutesTable({ routes, loading }: { routes: MockRoute[]; loading: boolea
             <TableCell>Status</TableCell>
             <TableCell>Tags</TableCell>
             <TableCell>Updated</TableCell>
+            <TableCell align="right">Action</TableCell>
           </TableRow>
         </TableHead>
         <TableBody>
@@ -387,11 +553,16 @@ function RoutesTable({ routes, loading }: { routes: MockRoute[]; loading: boolea
                 </Stack>
               </TableCell>
               <TableCell>{formatDate(route.updated_at)}</TableCell>
+              <TableCell align="right">
+                <Button size="small" startIcon={<SettingsIcon />} onClick={() => onEdit(route)}>
+                  Settings
+                </Button>
+              </TableCell>
             </TableRow>
           ))}
           {!loading && routes.length === 0 && (
             <TableRow>
-              <TableCell colSpan={6} align="center" className="emptyCell">
+              <TableCell colSpan={7} align="center" className="emptyCell">
                 No routes
               </TableCell>
             </TableRow>
@@ -459,6 +630,18 @@ function ConvertDialog({
               fullWidth
             />
             <FormControl fullWidth>
+              <InputLabel id="profile-kind-label">Profile type</InputLabel>
+              <Select
+                labelId="profile-kind-label"
+                label="Profile type"
+                value={form.profileKind}
+                onChange={(event) => onChange({ ...form, profileKind: event.target.value as ProfileKind })}
+              >
+                <MenuItem value="static">static</MenuItem>
+                <MenuItem value="dynamic">dynamic</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControl fullWidth>
               <InputLabel id="scenario-kind-label">Kind</InputLabel>
               <Select
                 labelId="scenario-kind-label"
@@ -474,7 +657,17 @@ function ConvertDialog({
             </FormControl>
           </Stack>
 
-          <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+          {form.profileKind === 'dynamic' && (
+            <TextField
+              label="Proxy URL"
+              value={form.proxyUrl}
+              onChange={(event) => onChange({ ...form, proxyUrl: event.target.value })}
+              fullWidth
+            />
+          )}
+
+          {form.profileKind === 'static' && (
+            <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
             <TextField
               label="Status"
               type="number"
@@ -491,27 +684,43 @@ function ConvertDialog({
               fullWidth
               inputProps={{ min: 0 }}
             />
-          </Stack>
+            </Stack>
+          )}
 
-          <TextField
-            label="Response headers"
-            value={form.responseHeaders}
-            onChange={(event) => onChange({ ...form, responseHeaders: event.target.value })}
-            minRows={4}
-            multiline
-            fullWidth
-            className="monoInput"
-          />
+          {form.profileKind === 'static' && (
+            <>
+              <TextField
+                label="Response headers"
+                value={form.responseHeaders}
+                onChange={(event) => onChange({ ...form, responseHeaders: event.target.value })}
+                minRows={4}
+                multiline
+                fullWidth
+                className="monoInput"
+              />
 
-          <TextField
-            label="Response body"
-            value={form.responseBody}
-            onChange={(event) => onChange({ ...form, responseBody: event.target.value })}
-            minRows={8}
-            multiline
-            fullWidth
-            className="monoInput"
-          />
+              <TextField
+                label="Response body"
+                value={form.responseBody}
+                onChange={(event) => onChange({ ...form, responseBody: event.target.value })}
+                minRows={8}
+                multiline
+                fullWidth
+                className="monoInput"
+              />
+            </>
+          )}
+
+          {form.profileKind === 'dynamic' && (
+            <TextField
+              label="Delay ms"
+              type="number"
+              value={form.delayMs}
+              onChange={(event) => onChange({ ...form, delayMs: Number(event.target.value) })}
+              fullWidth
+              inputProps={{ min: 0 }}
+            />
+          )}
         </Stack>
       </DialogContent>
       <DialogActions>
@@ -519,6 +728,261 @@ function ConvertDialog({
         <Button variant="contained" startIcon={<SaveIcon />} onClick={onSave} disabled={saving}>
           Save
         </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+function RouteSettingsDialog({
+  route,
+  profiles,
+  routeForm,
+  profileForm,
+  editingProfileId,
+  saving,
+  onRouteFormChange,
+  onProfileFormChange,
+  onClose,
+  onSaveRoute,
+  onSaveProfile,
+  onEditProfile,
+  onActivateProfile
+}: {
+  route: MockRoute | null;
+  profiles: RouteProfile[];
+  routeForm: RouteForm;
+  profileForm: ConvertForm;
+  editingProfileId: string | null;
+  saving: boolean;
+  onRouteFormChange: (form: RouteForm) => void;
+  onProfileFormChange: (form: ConvertForm) => void;
+  onClose: () => void;
+  onSaveRoute: () => void;
+  onSaveProfile: () => void;
+  onEditProfile: (profile: RouteProfile) => void;
+  onActivateProfile: (profileId: string) => void;
+}) {
+  return (
+    <Dialog open={Boolean(route)} onClose={onClose} fullWidth maxWidth="lg">
+      <DialogTitle className="dialogTitle">
+        <Box>
+          <Typography variant="h6" component="div">
+            {route ? `${route.method} ${route.path_pattern}` : 'Route settings'}
+          </Typography>
+          {route && (
+            <Typography variant="body2" color="text.secondary">
+              {route.id}
+            </Typography>
+          )}
+        </Box>
+        <IconButton onClick={onClose} aria-label="Close">
+          <CloseIcon />
+        </IconButton>
+      </DialogTitle>
+      <DialogContent dividers>
+        <Stack spacing={2.5}>
+          <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+            <TextField
+              label="Method"
+              value={routeForm.method}
+              onChange={(event) => onRouteFormChange({ ...routeForm, method: event.target.value })}
+              fullWidth
+            />
+            <TextField
+              label="Path pattern"
+              value={routeForm.pathPattern}
+              onChange={(event) => onRouteFormChange({ ...routeForm, pathPattern: event.target.value })}
+              fullWidth
+              className="monoInput"
+            />
+          </Stack>
+          <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+            <TextField
+              label="Route name"
+              value={routeForm.name}
+              onChange={(event) => onRouteFormChange({ ...routeForm, name: event.target.value })}
+              fullWidth
+            />
+            <TextField
+              label="Tags"
+              value={routeForm.tags}
+              onChange={(event) => onRouteFormChange({ ...routeForm, tags: event.target.value })}
+              fullWidth
+            />
+            <FormControl fullWidth>
+              <InputLabel id="route-status-label">Status</InputLabel>
+              <Select
+                labelId="route-status-label"
+                label="Status"
+                value={routeForm.status}
+                onChange={(event) => onRouteFormChange({ ...routeForm, status: event.target.value as RouteStatus })}
+              >
+                <MenuItem value="active">active</MenuItem>
+                <MenuItem value="disabled">disabled</MenuItem>
+              </Select>
+            </FormControl>
+          </Stack>
+          <Box>
+            <Button variant="contained" startIcon={<SaveIcon />} onClick={onSaveRoute} disabled={saving}>
+              Save route
+            </Button>
+          </Box>
+
+          <Divider />
+
+          <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+            Profiles
+          </Typography>
+          <TableContainer component={Paper} variant="outlined">
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>Name</TableCell>
+                  <TableCell>Type</TableCell>
+                  <TableCell>Target / response</TableCell>
+                  <TableCell align="right">Delay</TableCell>
+                  <TableCell align="right">Action</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {profiles.map((profile) => (
+                  <TableRow key={profile.id} hover selected={profile.id === route?.active_scenario_id}>
+                    <TableCell>{profile.name}</TableCell>
+                    <TableCell>
+                      <Chip size="small" label={profile.profile_kind} color={profile.profile_kind === 'dynamic' ? 'primary' : 'default'} />
+                    </TableCell>
+                    <TableCell className="bodyCell">
+                      {profile.profile_kind === 'dynamic'
+                        ? profile.proxy_url
+                        : `${profile.status_code} ${profile.response_body ?? ''}`}
+                    </TableCell>
+                    <TableCell align="right">{profile.delay_ms}</TableCell>
+                    <TableCell align="right">
+                      <Tooltip title="Edit profile">
+                        <IconButton size="small" onClick={() => onEditProfile(profile)}>
+                          <EditIcon fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                      <Tooltip title="Set active">
+                        <span>
+                          <IconButton
+                            size="small"
+                            onClick={() => onActivateProfile(profile.id)}
+                            disabled={profile.id === route?.active_scenario_id || saving}
+                          >
+                            <PlayArrowIcon fontSize="small" />
+                          </IconButton>
+                        </span>
+                      </Tooltip>
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {profiles.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={5} align="center" className="emptyCell">
+                      No profiles
+                    </TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </TableContainer>
+
+          <Stack spacing={2}>
+            <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>
+              {editingProfileId ? 'Edit profile' : 'New profile'}
+            </Typography>
+            <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+              <TextField
+                label="Profile name"
+                value={profileForm.scenarioName}
+                onChange={(event) => onProfileFormChange({ ...profileForm, scenarioName: event.target.value })}
+                fullWidth
+              />
+              <FormControl fullWidth>
+                <InputLabel id="settings-profile-kind-label">Profile type</InputLabel>
+                <Select
+                  labelId="settings-profile-kind-label"
+                  label="Profile type"
+                  value={profileForm.profileKind}
+                  onChange={(event) => onProfileFormChange({ ...profileForm, profileKind: event.target.value as ProfileKind })}
+                >
+                  <MenuItem value="static">static</MenuItem>
+                  <MenuItem value="dynamic">dynamic</MenuItem>
+                </Select>
+              </FormControl>
+              <TextField
+                label="Delay ms"
+                type="number"
+                value={profileForm.delayMs}
+                onChange={(event) => onProfileFormChange({ ...profileForm, delayMs: Number(event.target.value) })}
+                fullWidth
+                inputProps={{ min: 0 }}
+              />
+            </Stack>
+            {profileForm.profileKind === 'dynamic' ? (
+              <TextField
+                label="Proxy URL"
+                value={profileForm.proxyUrl}
+                onChange={(event) => onProfileFormChange({ ...profileForm, proxyUrl: event.target.value })}
+                fullWidth
+              />
+            ) : (
+              <>
+                <Stack direction={{ xs: 'column', md: 'row' }} spacing={2}>
+                  <TextField
+                    label="Status"
+                    type="number"
+                    value={profileForm.statusCode}
+                    onChange={(event) => onProfileFormChange({ ...profileForm, statusCode: Number(event.target.value) })}
+                    fullWidth
+                    inputProps={{ min: 100, max: 599 }}
+                  />
+                  <FormControl fullWidth>
+                    <InputLabel id="settings-scenario-kind-label">Kind</InputLabel>
+                    <Select
+                      labelId="settings-scenario-kind-label"
+                      label="Kind"
+                      value={profileForm.kind}
+                      onChange={(event) => onProfileFormChange({ ...profileForm, kind: event.target.value as ScenarioKind })}
+                    >
+                      <MenuItem value="success">success</MenuItem>
+                      <MenuItem value="error">error</MenuItem>
+                      <MenuItem value="timeout">timeout</MenuItem>
+                      <MenuItem value="custom">custom</MenuItem>
+                    </Select>
+                  </FormControl>
+                </Stack>
+                <TextField
+                  label="Response headers"
+                  value={profileForm.responseHeaders}
+                  onChange={(event) => onProfileFormChange({ ...profileForm, responseHeaders: event.target.value })}
+                  minRows={3}
+                  multiline
+                  fullWidth
+                  className="monoInput"
+                />
+                <TextField
+                  label="Response body"
+                  value={profileForm.responseBody}
+                  onChange={(event) => onProfileFormChange({ ...profileForm, responseBody: event.target.value })}
+                  minRows={6}
+                  multiline
+                  fullWidth
+                  className="monoInput"
+                />
+              </>
+            )}
+            <Box>
+              <Button variant="outlined" startIcon={<AddIcon />} onClick={onSaveProfile} disabled={saving}>
+                {editingProfileId ? 'Save profile' : 'Add profile'}
+              </Button>
+            </Box>
+          </Stack>
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>Close</Button>
       </DialogActions>
     </Dialog>
   );
@@ -541,6 +1005,18 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   return parseResponse<T>(response);
 }
 
+async function apiPut<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: 'PUT',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+
+  return parseResponse<T>(response);
+}
+
 async function parseResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
@@ -548,6 +1024,30 @@ async function parseResponse<T>(response: Response): Promise<T> {
   }
 
   return response.json() as Promise<T>;
+}
+
+function profilePayload(form: ConvertForm) {
+  const headers =
+    form.profileKind === 'static' ? parseJsonObject(form.responseHeaders, 'Response headers') : {};
+
+  return {
+    name: form.scenarioName,
+    profile_kind: form.profileKind,
+    kind: form.kind,
+    proxy_url: form.profileKind === 'dynamic' ? form.proxyUrl : undefined,
+    status_code: form.statusCode,
+    response_headers: headers,
+    response_body: form.profileKind === 'static' ? form.responseBody : undefined,
+    delay_ms: form.delayMs,
+    selection_rules: {}
+  };
+}
+
+function splitTags(value: string): string[] {
+  return value
+    .split(',')
+    .map((tag) => tag.trim())
+    .filter(Boolean);
 }
 
 function parseJsonObject(value: string, label: string): Record<string, string> {

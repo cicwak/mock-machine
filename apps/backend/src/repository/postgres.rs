@@ -9,7 +9,8 @@ use uuid::Uuid;
 use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
-        MockRoute, ResponseScenario, ScenarioKind, UnknownRequest, UnknownRequestStatus,
+        CreateScenario, MockRoute, ProfileKind, ResponseScenario, ScenarioKind, UnknownRequest,
+        UnknownRequestStatus, UpsertRoute,
     },
     entities::{mock_routes, response_scenarios, unknown_requests},
     repository::{
@@ -86,6 +87,133 @@ impl MockRouteRepository for PostgresRepository {
             .context("failed to get route")?;
 
         model.map(MockRoute::try_from).transpose()
+    }
+
+    async fn upsert_route(
+        &self,
+        id: Option<Uuid>,
+        request: UpsertRoute,
+    ) -> RepositoryResult<MockRoute> {
+        validate_route_request(&request)?;
+
+        if let Some(id) = id {
+            let route = mock_routes::Entity::find_by_id(id)
+                .one(&self.db)
+                .await
+                .context("failed to load route")?
+                .ok_or(RepositoryError::NotFound)?;
+
+            let mut update: mock_routes::ActiveModel = route.into();
+            update.method = Set(request.method.to_uppercase());
+            update.path_pattern = Set(request.path_pattern);
+            update.name = Set(request.name);
+            update.tags = Set(request.tags);
+            update.status = Set(to_db_route_status(request.status));
+            update.active_scenario_id = Set(request.active_scenario_id);
+
+            return update_route(update, &self.db).await;
+        }
+
+        let route = mock_routes::ActiveModel {
+            method: Set(request.method.to_uppercase()),
+            path_pattern: Set(request.path_pattern),
+            name: Set(request.name),
+            tags: Set(request.tags),
+            status: Set(to_db_route_status(request.status)),
+            active_scenario_id: Set(request.active_scenario_id),
+            ..Default::default()
+        };
+
+        insert_route(route, &self.db).await
+    }
+
+    async fn list_profiles(&self, route_id: Uuid) -> RepositoryResult<Vec<ResponseScenario>> {
+        ensure_route_exists(&self.db, route_id).await?;
+
+        response_scenarios::Entity::find()
+            .filter(response_scenarios::Column::RouteId.eq(route_id))
+            .order_by_asc(response_scenarios::Column::Name)
+            .all(&self.db)
+            .await
+            .context("failed to list route profiles")?
+            .into_iter()
+            .map(ResponseScenario::try_from)
+            .collect()
+    }
+
+    async fn upsert_profile(
+        &self,
+        route_id: Uuid,
+        profile_id: Option<Uuid>,
+        request: CreateScenario,
+    ) -> RepositoryResult<ResponseScenario> {
+        ensure_route_exists(&self.db, route_id).await?;
+        validate_profile_request(&request)?;
+
+        if let Some(profile_id) = profile_id {
+            let profile = response_scenarios::Entity::find_by_id(profile_id)
+                .filter(response_scenarios::Column::RouteId.eq(route_id))
+                .one(&self.db)
+                .await
+                .context("failed to load route profile")?
+                .ok_or(RepositoryError::NotFound)?;
+
+            let mut update: response_scenarios::ActiveModel = profile.into();
+            fill_profile_model(&mut update, request);
+            return update
+                .update(&self.db)
+                .await
+                .context("failed to update route profile")?
+                .try_into();
+        }
+
+        response_scenarios::ActiveModel {
+            route_id: Set(route_id),
+            name: Set(request.name),
+            profile_kind: Set(to_db_profile_kind(request.profile_kind)),
+            kind: Set(to_db_scenario_kind(request.kind)),
+            proxy_url: Set(request.proxy_url),
+            status_code: Set(request.status_code),
+            response_headers: Set(request.response_headers),
+            response_body: Set(request.response_body),
+            delay_ms: Set(request.delay_ms),
+            selection_rules: Set(request.selection_rules),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await
+        .map_err(map_profile_insert_error)?
+        .try_into()
+    }
+
+    async fn set_active_profile(
+        &self,
+        route_id: Uuid,
+        profile_id: Uuid,
+    ) -> RepositoryResult<MockRoute> {
+        let route = mock_routes::Entity::find_by_id(route_id)
+            .one(&self.db)
+            .await
+            .context("failed to load route")?
+            .ok_or(RepositoryError::NotFound)?;
+
+        let profile_exists = response_scenarios::Entity::find_by_id(profile_id)
+            .filter(response_scenarios::Column::RouteId.eq(route_id))
+            .one(&self.db)
+            .await
+            .context("failed to load route profile")?
+            .is_some();
+        if !profile_exists {
+            return Err(RepositoryError::NotFound);
+        }
+
+        let mut update: mock_routes::ActiveModel = route.into();
+        update.active_scenario_id = Set(Some(profile_id));
+        update
+            .update(&self.db)
+            .await
+            .context("failed to set active route profile")?
+            .try_into()
     }
 
     async fn find_active_response(
@@ -259,7 +387,9 @@ async fn convert_unknown_request_tx(
     let scenario = response_scenarios::ActiveModel {
         route_id: Set(route.id),
         name: Set(request.scenario.name),
+        profile_kind: Set(to_db_profile_kind(request.scenario.profile_kind)),
         kind: Set(to_db_scenario_kind(request.scenario.kind)),
+        proxy_url: Set(request.scenario.proxy_url),
         status_code: Set(request.scenario.status_code),
         response_headers: Set(request.scenario.response_headers),
         response_body: Set(request.scenario.response_body),
@@ -294,30 +424,71 @@ async fn convert_unknown_request_tx(
 }
 
 fn validate_convert_request(request: &ConvertUnknownRequest) -> RepositoryResult<()> {
-    if !(100..=599).contains(&request.scenario.status_code) {
+    validate_profile_request(&request.scenario)
+}
+
+fn validate_profile_request(request: &CreateScenario) -> RepositoryResult<()> {
+    if request.profile_kind == ProfileKind::Dynamic {
+        let proxy_url = request.proxy_url.as_deref().unwrap_or_default();
+        if !(proxy_url.starts_with("http://") || proxy_url.starts_with("https://")) {
+            return Err(RepositoryError::Validation(
+                "profile.proxy_url must be an http(s) URL for dynamic profiles".to_string(),
+            ));
+        }
+    }
+
+    if !(100..=599).contains(&request.status_code) {
         return Err(RepositoryError::Validation(
             "scenario.status_code must be between 100 and 599".to_string(),
         ));
     }
 
-    if request.scenario.delay_ms < 0 {
+    if request.delay_ms < 0 {
         return Err(RepositoryError::Validation(
             "scenario.delay_ms must be non-negative".to_string(),
         ));
     }
 
-    if !request.scenario.response_headers.is_object() {
+    if !request.response_headers.is_object() {
         return Err(RepositoryError::Validation(
             "scenario.response_headers must be a JSON object".to_string(),
         ));
     }
 
-    if !request.scenario.selection_rules.is_object() {
+    if !request.selection_rules.is_object() {
         return Err(RepositoryError::Validation(
             "scenario.selection_rules must be a JSON object".to_string(),
         ));
     }
 
+    Ok(())
+}
+
+fn validate_route_request(request: &UpsertRoute) -> RepositoryResult<()> {
+    if request.method.trim().is_empty() {
+        return Err(RepositoryError::Validation(
+            "route.method cannot be empty".to_string(),
+        ));
+    }
+    if !request.path_pattern.starts_with('/') {
+        return Err(RepositoryError::Validation(
+            "route.path_pattern must start with /".to_string(),
+        ));
+    }
+    if request.path_pattern == "/mockadmin"
+        || request.path_pattern.starts_with("/mockadmin/")
+        || request.path_pattern == "/mockadminapi"
+        || request.path_pattern.starts_with("/mockadminapi/")
+    {
+        return Err(RepositoryError::Validation(
+            "admin paths cannot be used as mock routes".to_string(),
+        ));
+    }
+    if request.name.trim().is_empty() {
+        return Err(RepositoryError::Validation(
+            "route.name cannot be empty".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -393,7 +564,9 @@ impl TryFrom<response_scenarios::Model> for ResponseScenario {
             id: value.id,
             route_id: value.route_id,
             name: value.name,
+            profile_kind: from_db_profile_kind(value.profile_kind),
             kind: from_db_scenario_kind(value.kind),
+            proxy_url: value.proxy_url,
             status_code: value.status_code,
             response_headers: value.response_headers,
             response_body: value.response_body,
@@ -402,6 +575,99 @@ impl TryFrom<response_scenarios::Model> for ResponseScenario {
             created_at: value.created_at,
             updated_at: value.updated_at,
         })
+    }
+}
+
+async fn ensure_route_exists<C>(db: &C, route_id: Uuid) -> RepositoryResult<()>
+where
+    C: ConnectionTrait,
+{
+    let exists = mock_routes::Entity::find_by_id(route_id)
+        .one(db)
+        .await
+        .context("failed to load route")?
+        .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(RepositoryError::NotFound)
+    }
+}
+
+async fn insert_route<C>(route: mock_routes::ActiveModel, db: &C) -> RepositoryResult<MockRoute>
+where
+    C: ConnectionTrait,
+{
+    route
+        .insert(db)
+        .await
+        .map_err(map_route_write_error)?
+        .try_into()
+}
+
+async fn update_route<C>(route: mock_routes::ActiveModel, db: &C) -> RepositoryResult<MockRoute>
+where
+    C: ConnectionTrait,
+{
+    route
+        .update(db)
+        .await
+        .map_err(map_route_write_error)?
+        .try_into()
+}
+
+fn map_route_write_error(error: sea_orm::DbErr) -> RepositoryError {
+    if error
+        .to_string()
+        .contains("mock_routes_method_path_pattern_key")
+    {
+        RepositoryError::Conflict("route already exists for this method and path".to_string())
+    } else {
+        RepositoryError::Internal(error.into())
+    }
+}
+
+fn map_profile_insert_error(error: sea_orm::DbErr) -> RepositoryError {
+    if error
+        .to_string()
+        .contains("response_scenarios_route_name_key")
+    {
+        RepositoryError::Conflict("profile already exists for this route and name".to_string())
+    } else {
+        RepositoryError::Internal(error.into())
+    }
+}
+
+fn fill_profile_model(model: &mut response_scenarios::ActiveModel, request: CreateScenario) {
+    model.name = Set(request.name);
+    model.profile_kind = Set(to_db_profile_kind(request.profile_kind));
+    model.kind = Set(to_db_scenario_kind(request.kind));
+    model.proxy_url = Set(request.proxy_url);
+    model.status_code = Set(request.status_code);
+    model.response_headers = Set(request.response_headers);
+    model.response_body = Set(request.response_body);
+    model.delay_ms = Set(request.delay_ms);
+    model.selection_rules = Set(request.selection_rules);
+}
+
+fn to_db_route_status(status: crate::domain::RouteStatus) -> mock_routes::RouteStatus {
+    match status {
+        crate::domain::RouteStatus::Active => mock_routes::RouteStatus::Active,
+        crate::domain::RouteStatus::Disabled => mock_routes::RouteStatus::Disabled,
+    }
+}
+
+fn to_db_profile_kind(kind: ProfileKind) -> response_scenarios::ProfileKind {
+    match kind {
+        ProfileKind::Static => response_scenarios::ProfileKind::Static,
+        ProfileKind::Dynamic => response_scenarios::ProfileKind::Dynamic,
+    }
+}
+
+fn from_db_profile_kind(kind: response_scenarios::ProfileKind) -> ProfileKind {
+    match kind {
+        response_scenarios::ProfileKind::Static => ProfileKind::Static,
+        response_scenarios::ProfileKind::Dynamic => ProfileKind::Dynamic,
     }
 }
 

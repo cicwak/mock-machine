@@ -21,6 +21,13 @@ pub enum ScenarioKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ProfileKind {
+    Static,
+    Dynamic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum UnknownRequestStatus {
     New,
     Ignored,
@@ -70,7 +77,9 @@ pub struct ResponseScenario {
     pub id: Uuid,
     pub route_id: Uuid,
     pub name: String,
+    pub profile_kind: ProfileKind,
     pub kind: ScenarioKind,
+    pub proxy_url: Option<String>,
     pub status_code: i32,
     pub response_headers: Value,
     pub response_body: Option<String>,
@@ -89,7 +98,9 @@ pub struct ActiveMockResponse {
 #[derive(Debug, Clone)]
 pub struct CreateScenario {
     pub name: String,
+    pub profile_kind: ProfileKind,
     pub kind: ScenarioKind,
+    pub proxy_url: Option<String>,
     pub status_code: i32,
     pub response_headers: Value,
     pub response_body: Option<String>,
@@ -102,6 +113,16 @@ pub struct ConvertUnknownRequest {
     pub name: Option<String>,
     pub tags: Vec<String>,
     pub scenario: CreateScenario,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpsertRoute {
+    pub method: String,
+    pub path_pattern: String,
+    pub name: String,
+    pub tags: Vec<String>,
+    pub status: RouteStatus,
+    pub active_scenario_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

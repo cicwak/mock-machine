@@ -9,13 +9,14 @@ mod config;
 mod domain;
 mod entities;
 mod http;
+mod migrations;
 mod repository;
 mod state;
 
 use config::{AppConfig, StorageMode};
 use repository::{
-    in_memory::InMemoryRepository, minio::MinioObjectAssetRepository, postgres::PostgresRepository,
-    redis::RedisRepository,
+    cached::CachedRouteRepository, in_memory::InMemoryRepository,
+    minio::MinioObjectAssetRepository, postgres::PostgresRepository, redis::RedisRepository,
 };
 use state::AppState;
 
@@ -61,14 +62,31 @@ async fn build_state(config: &AppConfig) -> anyhow::Result<AppState> {
             let db = Database::connect(database_url)
                 .await
                 .context("failed to connect to PostgreSQL")?;
+            migrations::run(&db)
+                .await
+                .context("failed to run database migrations")?;
             let postgres = Arc::new(PostgresRepository::new(db));
+            let routes: Arc<dyn repository::MockRouteRepository> =
+                if let Some(redis_url) = config.redis_url.as_ref() {
+                    Arc::new(
+                        CachedRouteRepository::new((*postgres).clone(), redis_url, 300)
+                            .await
+                            .context("failed to build route cache")?,
+                    )
+                } else {
+                    postgres.clone()
+                };
             let assets = build_asset_repository(config).await;
 
             Ok(AppState {
                 unknown_requests: postgres.clone(),
-                routes: postgres,
+                routes,
                 assets,
-                storage: "postgres",
+                storage: if config.redis_url.is_some() {
+                    "postgres+redis-cache"
+                } else {
+                    "postgres"
+                },
             })
         }
         StorageMode::InMemory => {

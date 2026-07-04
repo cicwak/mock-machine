@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
-        MockRoute, ObjectAsset, ResponseScenario, RouteStatus, UnknownRequest,
-        UnknownRequestStatus,
+        CreateScenario, MockRoute, ObjectAsset, ProfileKind, ResponseScenario, RouteStatus,
+        UnknownRequest, UnknownRequestStatus, UpsertRoute,
     },
     repository::{
         MockRouteRepository, ObjectAssetRepository, RepositoryError, RepositoryResult,
@@ -192,6 +192,129 @@ impl MockRouteRepository for RedisRepository {
         load_json(&mut conn, &route_key(id)).await
     }
 
+    async fn upsert_route(
+        &self,
+        id: Option<Uuid>,
+        request: UpsertRoute,
+    ) -> RepositoryResult<MockRoute> {
+        let mut conn = self.conn().await?;
+        let id = id.unwrap_or_else(Uuid::new_v4);
+        let now = Utc::now();
+        let created_at = load_json::<MockRoute>(&mut conn, &route_key(id))
+            .await?
+            .map(|route| route.created_at)
+            .unwrap_or(now);
+        let route = MockRoute {
+            id,
+            method: request.method.to_uppercase(),
+            path_pattern: request.path_pattern,
+            name: request.name,
+            tags: request.tags,
+            status: request.status,
+            active_scenario_id: request.active_scenario_id,
+            created_at,
+            updated_at: now,
+        };
+        let _: () = redis::pipe()
+            .set(route_key(id), serde_json::to_string(&route)?)
+            .set(
+                route_index_key(&route.method, &route.path_pattern),
+                id.to_string(),
+            )
+            .zadd(ROUTE_SET, id.to_string(), created_at.timestamp_millis())
+            .query_async(&mut conn)
+            .await?;
+        Ok(route)
+    }
+
+    async fn list_profiles(&self, route_id: Uuid) -> RepositoryResult<Vec<ResponseScenario>> {
+        let mut conn = self.conn().await?;
+        if load_json::<MockRoute>(&mut conn, &route_key(route_id))
+            .await?
+            .is_none()
+        {
+            return Err(RepositoryError::NotFound);
+        }
+        let ids: Vec<String> = conn.zrange(route_profiles_key(route_id), 0, -1).await?;
+        let mut profiles = Vec::new();
+        for id in ids {
+            let id = Uuid::parse_str(&id).context("invalid profile id in Redis")?;
+            if let Some(profile) = load_json(&mut conn, &scenario_key(id)).await? {
+                profiles.push(profile);
+            }
+        }
+        profiles.sort_by(|left: &ResponseScenario, right| left.name.cmp(&right.name));
+        Ok(profiles)
+    }
+
+    async fn upsert_profile(
+        &self,
+        route_id: Uuid,
+        profile_id: Option<Uuid>,
+        request: CreateScenario,
+    ) -> RepositoryResult<ResponseScenario> {
+        validate_profile_request(&request)?;
+        let mut conn = self.conn().await?;
+        if load_json::<MockRoute>(&mut conn, &route_key(route_id))
+            .await?
+            .is_none()
+        {
+            return Err(RepositoryError::NotFound);
+        }
+        let id = profile_id.unwrap_or_else(Uuid::new_v4);
+        let now = Utc::now();
+        let created_at = load_json::<ResponseScenario>(&mut conn, &scenario_key(id))
+            .await?
+            .map(|profile| profile.created_at)
+            .unwrap_or(now);
+        let profile = ResponseScenario {
+            id,
+            route_id,
+            name: request.name,
+            profile_kind: request.profile_kind,
+            kind: request.kind,
+            proxy_url: request.proxy_url,
+            status_code: request.status_code,
+            response_headers: request.response_headers,
+            response_body: request.response_body,
+            delay_ms: request.delay_ms,
+            selection_rules: request.selection_rules,
+            created_at,
+            updated_at: now,
+        };
+        let _: () = redis::pipe()
+            .set(scenario_key(id), serde_json::to_string(&profile)?)
+            .zadd(
+                route_profiles_key(route_id),
+                id.to_string(),
+                created_at.timestamp_millis(),
+            )
+            .query_async(&mut conn)
+            .await?;
+        Ok(profile)
+    }
+
+    async fn set_active_profile(
+        &self,
+        route_id: Uuid,
+        profile_id: Uuid,
+    ) -> RepositoryResult<MockRoute> {
+        let mut conn = self.conn().await?;
+        let Some(mut route) = load_json::<MockRoute>(&mut conn, &route_key(route_id)).await? else {
+            return Err(RepositoryError::NotFound);
+        };
+        let profile = load_json::<ResponseScenario>(&mut conn, &scenario_key(profile_id)).await?;
+        if !profile.is_some_and(|profile| profile.route_id == route_id) {
+            return Err(RepositoryError::NotFound);
+        }
+        route.active_scenario_id = Some(profile_id);
+        route.updated_at = Utc::now();
+        let _: () = conn
+            .set(route_key(route_id), serde_json::to_string(&route)?)
+            .await?;
+        Ok(route)
+    }
+
     async fn find_active_response(
         &self,
         method: &str,
@@ -281,7 +404,9 @@ impl MockRouteRepository for RedisRepository {
             id: scenario_id,
             route_id,
             name: request.scenario.name,
+            profile_kind: request.scenario.profile_kind,
             kind: request.scenario.kind,
+            proxy_url: request.scenario.proxy_url,
             status_code: request.scenario.status_code,
             response_headers: request.scenario.response_headers,
             response_body: request.scenario.response_body,
@@ -298,6 +423,11 @@ impl MockRouteRepository for RedisRepository {
             .set(route_key(route_id), serde_json::to_string(&route)?)
             .set(scenario_key(scenario_id), serde_json::to_string(&scenario)?)
             .set(route_index, route_id.to_string())
+            .zadd(
+                route_profiles_key(route_id),
+                scenario_id.to_string(),
+                scenario.created_at.timestamp_millis(),
+            )
             .zadd(
                 ROUTE_SET,
                 route_id.to_string(),
@@ -383,25 +513,38 @@ async fn load_unknown(
 }
 
 fn validate_convert_request(request: &ConvertUnknownRequest) -> RepositoryResult<()> {
-    if !(100..=599).contains(&request.scenario.status_code) {
+    validate_profile_request(&request.scenario)
+}
+
+fn validate_profile_request(request: &CreateScenario) -> RepositoryResult<()> {
+    if request.profile_kind == ProfileKind::Dynamic {
+        let proxy_url = request.proxy_url.as_deref().unwrap_or_default();
+        if !(proxy_url.starts_with("http://") || proxy_url.starts_with("https://")) {
+            return Err(RepositoryError::Validation(
+                "profile.proxy_url must be an http(s) URL for dynamic profiles".to_string(),
+            ));
+        }
+    }
+
+    if !(100..=599).contains(&request.status_code) {
         return Err(RepositoryError::Validation(
             "scenario.status_code must be between 100 and 599".to_string(),
         ));
     }
 
-    if request.scenario.delay_ms < 0 {
+    if request.delay_ms < 0 {
         return Err(RepositoryError::Validation(
             "scenario.delay_ms must be non-negative".to_string(),
         ));
     }
 
-    if !request.scenario.response_headers.is_object() {
+    if !request.response_headers.is_object() {
         return Err(RepositoryError::Validation(
             "scenario.response_headers must be a JSON object".to_string(),
         ));
     }
 
-    if !request.scenario.selection_rules.is_object() {
+    if !request.selection_rules.is_object() {
         return Err(RepositoryError::Validation(
             "scenario.selection_rules must be a JSON object".to_string(),
         ));
@@ -431,6 +574,10 @@ fn route_index_key(method: &str, path: &str) -> String {
 
 fn scenario_key(id: Uuid) -> String {
     format!("mock-machine:scenario:{id}")
+}
+
+fn route_profiles_key(route_id: Uuid) -> String {
+    format!("mock-machine:route-profiles:{route_id}")
 }
 
 fn object_key_key(object_key: &str) -> String {

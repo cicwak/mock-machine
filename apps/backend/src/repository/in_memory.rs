@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
-        MockRoute, ObjectAsset, ResponseScenario, RouteStatus, UnknownRequest,
-        UnknownRequestStatus,
+        CreateScenario, MockRoute, ObjectAsset, ProfileKind, ResponseScenario, RouteStatus,
+        UnknownRequest, UnknownRequestStatus, UpsertRoute,
     },
     repository::{
         MockRouteRepository, ObjectAssetRepository, RepositoryError, RepositoryResult,
@@ -110,6 +110,104 @@ impl MockRouteRepository for InMemoryRepository {
         Ok(self.routes.read().await.get(&id).cloned())
     }
 
+    async fn upsert_route(
+        &self,
+        id: Option<Uuid>,
+        request: UpsertRoute,
+    ) -> RepositoryResult<MockRoute> {
+        let id = id.unwrap_or_else(Uuid::new_v4);
+        let now = Utc::now();
+        let mut routes = self.routes.write().await;
+        let created_at = routes.get(&id).map(|route| route.created_at).unwrap_or(now);
+        let route = MockRoute {
+            id,
+            method: request.method.to_uppercase(),
+            path_pattern: request.path_pattern,
+            name: request.name,
+            tags: request.tags,
+            status: request.status,
+            active_scenario_id: request.active_scenario_id,
+            created_at,
+            updated_at: now,
+        };
+        routes.insert(id, route.clone());
+        Ok(route)
+    }
+
+    async fn list_profiles(&self, route_id: Uuid) -> RepositoryResult<Vec<ResponseScenario>> {
+        if !self.routes.read().await.contains_key(&route_id) {
+            return Err(RepositoryError::NotFound);
+        }
+        let mut profiles = self
+            .scenarios
+            .read()
+            .await
+            .values()
+            .filter(|profile| profile.route_id == route_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        profiles.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(profiles)
+    }
+
+    async fn upsert_profile(
+        &self,
+        route_id: Uuid,
+        profile_id: Option<Uuid>,
+        request: CreateScenario,
+    ) -> RepositoryResult<ResponseScenario> {
+        if !self.routes.read().await.contains_key(&route_id) {
+            return Err(RepositoryError::NotFound);
+        }
+        validate_profile_request(&request)?;
+
+        let id = profile_id.unwrap_or_else(Uuid::new_v4);
+        let now = Utc::now();
+        let mut scenarios = self.scenarios.write().await;
+        let created_at = scenarios
+            .get(&id)
+            .map(|profile| profile.created_at)
+            .unwrap_or(now);
+        let profile = ResponseScenario {
+            id,
+            route_id,
+            name: request.name,
+            profile_kind: request.profile_kind,
+            kind: request.kind,
+            proxy_url: request.proxy_url,
+            status_code: request.status_code,
+            response_headers: request.response_headers,
+            response_body: request.response_body,
+            delay_ms: request.delay_ms,
+            selection_rules: request.selection_rules,
+            created_at,
+            updated_at: now,
+        };
+        scenarios.insert(id, profile.clone());
+        Ok(profile)
+    }
+
+    async fn set_active_profile(
+        &self,
+        route_id: Uuid,
+        profile_id: Uuid,
+    ) -> RepositoryResult<MockRoute> {
+        let profile_exists = self
+            .scenarios
+            .read()
+            .await
+            .get(&profile_id)
+            .is_some_and(|profile| profile.route_id == route_id);
+        if !profile_exists {
+            return Err(RepositoryError::NotFound);
+        }
+        let mut routes = self.routes.write().await;
+        let route = routes.get_mut(&route_id).ok_or(RepositoryError::NotFound)?;
+        route.active_scenario_id = Some(profile_id);
+        route.updated_at = Utc::now();
+        Ok(route.clone())
+    }
+
     async fn find_active_response(
         &self,
         method: &str,
@@ -205,7 +303,9 @@ impl MockRouteRepository for InMemoryRepository {
             id: scenario_id,
             route_id,
             name: request.scenario.name,
+            profile_kind: request.scenario.profile_kind,
             kind: request.scenario.kind,
+            proxy_url: request.scenario.proxy_url,
             status_code: request.scenario.status_code,
             response_headers: request.scenario.response_headers,
             response_body: request.scenario.response_body,
@@ -264,25 +364,38 @@ impl ObjectAssetRepository for InMemoryRepository {
 }
 
 fn validate_convert_request(request: &ConvertUnknownRequest) -> RepositoryResult<()> {
-    if !(100..=599).contains(&request.scenario.status_code) {
+    validate_profile_request(&request.scenario)
+}
+
+fn validate_profile_request(request: &CreateScenario) -> RepositoryResult<()> {
+    if request.profile_kind == ProfileKind::Dynamic {
+        let proxy_url = request.proxy_url.as_deref().unwrap_or_default();
+        if !(proxy_url.starts_with("http://") || proxy_url.starts_with("https://")) {
+            return Err(RepositoryError::Validation(
+                "profile.proxy_url must be an http(s) URL for dynamic profiles".to_string(),
+            ));
+        }
+    }
+
+    if !(100..=599).contains(&request.status_code) {
         return Err(RepositoryError::Validation(
             "scenario.status_code must be between 100 and 599".to_string(),
         ));
     }
 
-    if request.scenario.delay_ms < 0 {
+    if request.delay_ms < 0 {
         return Err(RepositoryError::Validation(
             "scenario.delay_ms must be non-negative".to_string(),
         ));
     }
 
-    if !request.scenario.response_headers.is_object() {
+    if !request.response_headers.is_object() {
         return Err(RepositoryError::Validation(
             "scenario.response_headers must be a JSON object".to_string(),
         ));
     }
 
-    if !request.scenario.selection_rules.is_object() {
+    if !request.selection_rules.is_object() {
         return Err(RepositoryError::Validation(
             "scenario.selection_rules must be a JSON object".to_string(),
         ));

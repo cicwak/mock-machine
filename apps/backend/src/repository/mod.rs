@@ -4,9 +4,10 @@ use uuid::Uuid;
 
 use crate::domain::{
     ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest, MockRoute,
-    ObjectAsset, UnknownRequest, UnknownRequestStatus,
+    ObjectAsset, ResponseScenario, UnknownRequest, UnknownRequestStatus, UpsertRoute,
 };
 
+pub mod cached;
 pub mod in_memory;
 pub mod minio;
 pub mod postgres;
@@ -56,6 +57,27 @@ pub trait MockRouteRepository: Send + Sync {
     async fn list_routes(&self) -> RepositoryResult<Vec<MockRoute>>;
 
     async fn get_route(&self, id: Uuid) -> RepositoryResult<Option<MockRoute>>;
+
+    async fn upsert_route(
+        &self,
+        id: Option<Uuid>,
+        request: UpsertRoute,
+    ) -> RepositoryResult<MockRoute>;
+
+    async fn list_profiles(&self, route_id: Uuid) -> RepositoryResult<Vec<ResponseScenario>>;
+
+    async fn upsert_profile(
+        &self,
+        route_id: Uuid,
+        profile_id: Option<Uuid>,
+        request: crate::domain::CreateScenario,
+    ) -> RepositoryResult<ResponseScenario>;
+
+    async fn set_active_profile(
+        &self,
+        route_id: Uuid,
+        profile_id: Uuid,
+    ) -> RepositoryResult<MockRoute>;
 
     async fn find_active_response(
         &self,
