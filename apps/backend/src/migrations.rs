@@ -20,6 +20,10 @@ const MIGRATIONS: &[Migration] = &[
         version: "0003_profiles",
         sql: include_str!("../migrations/0003_profiles.sql"),
     },
+    Migration {
+        version: "0004_projects",
+        sql: include_str!("../migrations/0004_projects.sql"),
+    },
 ];
 
 pub async fn run(db: &DatabaseConnection) -> anyhow::Result<()> {

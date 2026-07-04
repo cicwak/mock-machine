@@ -8,12 +8,13 @@ use uuid::Uuid;
 use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
-        CreateScenario, MockRoute, ObjectAsset, ProfileKind, ResponseScenario, RouteStatus,
-        UnknownRequest, UnknownRequestStatus, UpsertRoute, is_valid_http_method,
+        CreateProject, CreateScenario, MockRoute, ObjectAsset, ProfileKind, Project,
+        ResponseScenario, RouteStatus, UnknownRequest, UnknownRequestStatus, UpsertRoute,
+        is_valid_http_method,
     },
     repository::{
-        MockRouteRepository, ObjectAssetRepository, RepositoryError, RepositoryResult,
-        UnknownRequestRepository,
+        MockRouteRepository, ObjectAssetRepository, ProjectRepository, RepositoryError,
+        RepositoryResult, UnknownRequestRepository,
     },
 };
 
@@ -72,12 +73,75 @@ impl RedisRepository {
 }
 
 #[async_trait::async_trait]
+impl ProjectRepository for RedisRepository {
+    async fn list_projects(&self) -> RepositoryResult<Vec<Project>> {
+        let mut conn = self.conn().await?;
+        ensure_default_project(&mut conn).await?;
+        let ids: Vec<String> = conn.zrange(PROJECT_SET, 0, -1).await?;
+        let mut projects = Vec::new();
+
+        for id in ids {
+            let id = Uuid::parse_str(&id).context("invalid project id in Redis")?;
+            if let Some(project) = load_json::<Project>(&mut conn, &project_key(id)).await? {
+                projects.push(project);
+            }
+        }
+
+        projects.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(projects)
+    }
+
+    async fn get_project(&self, id: Uuid) -> RepositoryResult<Option<Project>> {
+        let mut conn = self.conn().await?;
+        ensure_default_project(&mut conn).await?;
+        load_json(&mut conn, &project_key(id)).await
+    }
+
+    async fn create_project(&self, request: CreateProject) -> RepositoryResult<Project> {
+        validate_project_request(&request)?;
+        let mut conn = self.conn().await?;
+        ensure_default_project(&mut conn).await?;
+        let name = request.name.trim().to_string();
+        let name_index = project_name_index_key(&name);
+        if conn.exists::<_, bool>(&name_index).await? {
+            return Err(RepositoryError::Conflict(
+                "project already exists with this name".to_string(),
+            ));
+        }
+
+        let now = Utc::now();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name,
+            created_at: now,
+            updated_at: now,
+        };
+        let _: () = redis::pipe()
+            .set(project_key(project.id), serde_json::to_string(&project)?)
+            .set(name_index, project.id.to_string())
+            .zadd(
+                PROJECT_SET,
+                project.id.to_string(),
+                project.created_at.timestamp_millis(),
+            )
+            .query_async(&mut conn)
+            .await?;
+        Ok(project)
+    }
+}
+
+#[async_trait::async_trait]
 impl UnknownRequestRepository for RedisRepository {
-    async fn capture(&self, request: CapturedRequest) -> RepositoryResult<UnknownRequest> {
+    async fn capture(
+        &self,
+        project_id: Uuid,
+        request: CapturedRequest,
+    ) -> RepositoryResult<UnknownRequest> {
         let method = request.method.to_uppercase();
-        let index_key = unknown_index_key(&method, &request.path);
+        let index_key = unknown_index_key(project_id, &method, &request.path);
         let now = Utc::now();
         let mut conn = self.conn().await?;
+        ensure_project_exists(&mut conn, project_id).await?;
 
         let id = match conn.get::<_, Option<String>>(&index_key).await? {
             Some(id) => Uuid::parse_str(&id).context("invalid unknown request id in Redis")?,
@@ -100,6 +164,7 @@ impl UnknownRequestRepository for RedisRepository {
                 .map(UnknownRequest::from)?,
             None => UnknownRequest {
                 id,
+                project_id,
                 method,
                 path: request.path.clone(),
                 query: request.query.clone(),
@@ -127,7 +192,7 @@ impl UnknownRequestRepository for RedisRepository {
         let score = unknown.last_seen_at.timestamp_millis();
         let _: () = redis::pipe()
             .set(&key, json)
-            .zadd(UNKNOWN_SET, unknown.id.to_string(), score)
+            .zadd(unknown_set_key(project_id), unknown.id.to_string(), score)
             .query_async(&mut conn)
             .await?;
 
@@ -136,12 +201,17 @@ impl UnknownRequestRepository for RedisRepository {
 
     async fn list(
         &self,
+        project_id: Uuid,
         status: Option<UnknownRequestStatus>,
         limit: u64,
     ) -> RepositoryResult<Vec<UnknownRequest>> {
         let mut conn = self.conn().await?;
         let ids: Vec<String> = conn
-            .zrevrange(UNKNOWN_SET, 0, limit.saturating_sub(1) as isize)
+            .zrevrange(
+                unknown_set_key(project_id),
+                0,
+                limit.saturating_sub(1) as isize,
+            )
             .await?;
         let mut result = Vec::new();
 
@@ -171,9 +241,9 @@ impl UnknownRequestRepository for RedisRepository {
 
 #[async_trait::async_trait]
 impl MockRouteRepository for RedisRepository {
-    async fn list_routes(&self) -> RepositoryResult<Vec<MockRoute>> {
+    async fn list_routes(&self, project_id: Uuid) -> RepositoryResult<Vec<MockRoute>> {
         let mut conn = self.conn().await?;
-        let ids: Vec<String> = conn.zrange(ROUTE_SET, 0, -1).await?;
+        let ids: Vec<String> = conn.zrange(route_set_key(project_id), 0, -1).await?;
         let mut routes = Vec::new();
 
         for id in ids {
@@ -194,12 +264,14 @@ impl MockRouteRepository for RedisRepository {
 
     async fn upsert_route(
         &self,
+        project_id: Uuid,
         id: Option<Uuid>,
         request: UpsertRoute,
     ) -> RepositoryResult<MockRoute> {
         validate_route_request(&request)?;
 
         let mut conn = self.conn().await?;
+        ensure_project_exists(&mut conn, project_id).await?;
         let id = id.unwrap_or_else(Uuid::new_v4);
         let now = Utc::now();
         let created_at = load_json::<MockRoute>(&mut conn, &route_key(id))
@@ -208,6 +280,7 @@ impl MockRouteRepository for RedisRepository {
             .unwrap_or(now);
         let route = MockRoute {
             id,
+            project_id,
             method: request.method.to_uppercase(),
             path_pattern: request.path_pattern,
             name: request.name,
@@ -220,10 +293,14 @@ impl MockRouteRepository for RedisRepository {
         let _: () = redis::pipe()
             .set(route_key(id), serde_json::to_string(&route)?)
             .set(
-                route_index_key(&route.method, &route.path_pattern),
+                route_index_key(project_id, &route.method, &route.path_pattern),
                 id.to_string(),
             )
-            .zadd(ROUTE_SET, id.to_string(), created_at.timestamp_millis())
+            .zadd(
+                route_set_key(project_id),
+                id.to_string(),
+                created_at.timestamp_millis(),
+            )
             .query_async(&mut conn)
             .await?;
         Ok(route)
@@ -319,12 +396,13 @@ impl MockRouteRepository for RedisRepository {
 
     async fn find_active_response(
         &self,
+        project_id: Uuid,
         method: &str,
         path: &str,
     ) -> RepositoryResult<Option<ActiveMockResponse>> {
         let mut conn = self.conn().await?;
         let Some(route_id) = conn
-            .get::<_, Option<String>>(route_index_key(&method.to_uppercase(), path))
+            .get::<_, Option<String>>(route_index_key(project_id, &method.to_uppercase(), path))
             .await?
         else {
             return Ok(None);
@@ -349,15 +427,20 @@ impl MockRouteRepository for RedisRepository {
 
     async fn convert_unknown_request(
         &self,
+        project_id: Uuid,
         id: Uuid,
         request: ConvertUnknownRequest,
     ) -> RepositoryResult<ConvertedUnknownRequest> {
         validate_convert_request(&request)?;
 
         let mut conn = self.conn().await?;
+        ensure_project_exists(&mut conn, project_id).await?;
         let Some(mut unknown) = load_unknown(&mut conn, &unknown_key(id)).await? else {
             return Err(RepositoryError::NotFound);
         };
+        if unknown.project_id != project_id {
+            return Err(RepositoryError::NotFound);
+        }
 
         if unknown.status == UnknownRequestStatus::Converted {
             return Err(RepositoryError::Conflict(
@@ -375,7 +458,7 @@ impl MockRouteRepository for RedisRepository {
             ));
         }
 
-        let route_index = route_index_key(&unknown.method, &unknown.path);
+        let route_index = route_index_key(project_id, &unknown.method, &unknown.path);
         if conn.exists::<_, bool>(&route_index).await? {
             return Err(RepositoryError::Conflict(
                 "route already exists for this method and path".to_string(),
@@ -387,6 +470,7 @@ impl MockRouteRepository for RedisRepository {
         let scenario_id = Uuid::new_v4();
         let route = MockRoute {
             id: route_id,
+            project_id,
             method: unknown.method.clone(),
             path_pattern: unknown.path.clone(),
             name: request.name.unwrap_or_else(|| {
@@ -431,7 +515,7 @@ impl MockRouteRepository for RedisRepository {
                 scenario.created_at.timestamp_millis(),
             )
             .zadd(
-                ROUTE_SET,
+                route_set_key(project_id),
                 route_id.to_string(),
                 route.created_at.timestamp_millis(),
             )
@@ -518,6 +602,15 @@ fn validate_convert_request(request: &ConvertUnknownRequest) -> RepositoryResult
     validate_profile_request(&request.scenario)
 }
 
+fn validate_project_request(request: &CreateProject) -> RepositoryResult<()> {
+    if request.name.trim().is_empty() {
+        return Err(RepositoryError::Validation(
+            "project.name cannot be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_route_request(request: &UpsertRoute) -> RepositoryResult<()> {
     if !is_valid_http_method(&request.method) {
         return Err(RepositoryError::Validation(
@@ -583,23 +676,38 @@ fn validate_profile_request(request: &CreateScenario) -> RepositoryResult<()> {
     Ok(())
 }
 
-const UNKNOWN_SET: &str = "mock-machine:unknown";
-const ROUTE_SET: &str = "mock-machine:routes";
+const PROJECT_SET: &str = "mock-machine:projects";
 
 fn unknown_key(id: Uuid) -> String {
     format!("mock-machine:unknown:{id}")
 }
 
-fn unknown_index_key(method: &str, path: &str) -> String {
-    format!("mock-machine:unknown-index:{method}:{path}")
+fn unknown_index_key(project_id: Uuid, method: &str, path: &str) -> String {
+    format!("mock-machine:unknown-index:{project_id}:{method}:{path}")
+}
+
+fn unknown_set_key(project_id: Uuid) -> String {
+    format!("mock-machine:unknown:{project_id}")
 }
 
 fn route_key(id: Uuid) -> String {
     format!("mock-machine:route:{id}")
 }
 
-fn route_index_key(method: &str, path: &str) -> String {
-    format!("mock-machine:route-index:{method}:{path}")
+fn route_index_key(project_id: Uuid, method: &str, path: &str) -> String {
+    format!("mock-machine:route-index:{project_id}:{method}:{path}")
+}
+
+fn route_set_key(project_id: Uuid) -> String {
+    format!("mock-machine:routes:{project_id}")
+}
+
+fn project_key(id: Uuid) -> String {
+    format!("mock-machine:project:{id}")
+}
+
+fn project_name_index_key(name: &str) -> String {
+    format!("mock-machine:project-name:{}", name.to_ascii_lowercase())
 }
 
 fn scenario_key(id: Uuid) -> String {
@@ -612,4 +720,47 @@ fn route_profiles_key(route_id: Uuid) -> String {
 
 fn object_key_key(object_key: &str) -> String {
     format!("mock-machine:object:{object_key}")
+}
+
+async fn ensure_project_exists(
+    conn: &mut redis::aio::MultiplexedConnection,
+    project_id: Uuid,
+) -> RepositoryResult<()> {
+    ensure_default_project(conn).await?;
+    if conn.exists::<_, bool>(project_key(project_id)).await? {
+        Ok(())
+    } else {
+        Err(RepositoryError::NotFound)
+    }
+}
+
+async fn ensure_default_project(
+    conn: &mut redis::aio::MultiplexedConnection,
+) -> RepositoryResult<Project> {
+    let name_index = project_name_index_key("Default");
+    if let Some(id) = conn.get::<_, Option<String>>(&name_index).await? {
+        let id = Uuid::parse_str(&id).context("invalid default project id in Redis")?;
+        if let Some(project) = load_json::<Project>(conn, &project_key(id)).await? {
+            return Ok(project);
+        }
+    }
+
+    let now = Utc::now();
+    let project = Project {
+        id: Uuid::new_v4(),
+        name: "Default".to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+    let _: () = redis::pipe()
+        .set(project_key(project.id), serde_json::to_string(&project)?)
+        .set(name_index, project.id.to_string())
+        .zadd(
+            PROJECT_SET,
+            project.id.to_string(),
+            project.created_at.timestamp_millis(),
+        )
+        .query_async(conn)
+        .await?;
+    Ok(project)
 }

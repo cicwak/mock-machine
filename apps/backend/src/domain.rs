@@ -52,8 +52,22 @@ pub struct CapturedRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateProject {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnknownRequest {
     pub id: Uuid,
+    pub project_id: Uuid,
     pub method: String,
     pub path: String,
     pub query: Value,
@@ -70,6 +84,7 @@ pub struct UnknownRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MockRoute {
     pub id: Uuid,
+    pub project_id: Uuid,
     pub method: String,
     pub path_pattern: String,
     pub name: String,

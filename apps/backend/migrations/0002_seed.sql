@@ -1,11 +1,18 @@
-INSERT INTO mock_routes (method, path_pattern, name, tags)
-VALUES ('GET', '/health/example', 'Example health mock', ARRAY['example'])
-ON CONFLICT (method, path_pattern) DO NOTHING;
+INSERT INTO projects (name)
+VALUES ('Default')
+ON CONFLICT (name) DO NOTHING;
+
+INSERT INTO mock_routes (project_id, method, path_pattern, name, tags)
+SELECT id, 'GET', '/health/example', 'Example health mock', ARRAY['example']
+FROM projects
+WHERE name = 'Default'
+ON CONFLICT (project_id, method, path_pattern) DO NOTHING;
 
 WITH route AS (
     SELECT id
     FROM mock_routes
-    WHERE method = 'GET' AND path_pattern = '/health/example'
+    WHERE project_id = (SELECT id FROM projects WHERE name = 'Default')
+      AND method = 'GET' AND path_pattern = '/health/example'
 ),
 scenario AS (
     INSERT INTO response_scenarios (

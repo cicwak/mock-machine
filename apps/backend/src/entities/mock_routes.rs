@@ -17,6 +17,7 @@ pub enum RouteStatus {
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
+    pub project_id: Uuid,
     pub method: String,
     pub path_pattern: String,
     pub name: String,

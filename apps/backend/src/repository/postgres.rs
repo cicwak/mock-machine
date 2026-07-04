@@ -9,12 +9,13 @@ use uuid::Uuid;
 use crate::{
     domain::{
         ActiveMockResponse, CapturedRequest, ConvertUnknownRequest, ConvertedUnknownRequest,
-        CreateScenario, MockRoute, ProfileKind, ResponseScenario, ScenarioKind, UnknownRequest,
-        UnknownRequestStatus, UpsertRoute, is_valid_http_method,
+        CreateProject, CreateScenario, MockRoute, ProfileKind, Project, ResponseScenario,
+        ScenarioKind, UnknownRequest, UnknownRequestStatus, UpsertRoute, is_valid_http_method,
     },
-    entities::{mock_routes, response_scenarios, unknown_requests},
+    entities::{mock_routes, projects, response_scenarios, unknown_requests},
     repository::{
-        MockRouteRepository, RepositoryError, RepositoryResult, UnknownRequestRepository,
+        MockRouteRepository, ProjectRepository, RepositoryError, RepositoryResult,
+        UnknownRequestRepository,
     },
 };
 
@@ -30,17 +31,60 @@ impl PostgresRepository {
 }
 
 #[async_trait::async_trait]
+impl ProjectRepository for PostgresRepository {
+    async fn list_projects(&self) -> RepositoryResult<Vec<Project>> {
+        projects::Entity::find()
+            .order_by_asc(projects::Column::Name)
+            .all(&self.db)
+            .await
+            .context("failed to list projects")?
+            .into_iter()
+            .map(Project::try_from)
+            .collect()
+    }
+
+    async fn get_project(&self, id: Uuid) -> RepositoryResult<Option<Project>> {
+        let model = projects::Entity::find_by_id(id)
+            .one(&self.db)
+            .await
+            .context("failed to get project")?;
+
+        model.map(Project::try_from).transpose()
+    }
+
+    async fn create_project(&self, request: CreateProject) -> RepositoryResult<Project> {
+        validate_project_request(&request)?;
+
+        projects::ActiveModel {
+            name: Set(request.name.trim().to_string()),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await
+        .map_err(map_project_write_error)?
+        .try_into()
+    }
+}
+
+#[async_trait::async_trait]
 impl UnknownRequestRepository for PostgresRepository {
-    async fn capture(&self, request: CapturedRequest) -> RepositoryResult<UnknownRequest> {
-        capture_unknown(&self.db, request).await
+    async fn capture(
+        &self,
+        project_id: Uuid,
+        request: CapturedRequest,
+    ) -> RepositoryResult<UnknownRequest> {
+        ensure_project_exists(&self.db, project_id).await?;
+        capture_unknown(&self.db, project_id, request).await
     }
 
     async fn list(
         &self,
+        project_id: Uuid,
         status: Option<UnknownRequestStatus>,
         limit: u64,
     ) -> RepositoryResult<Vec<UnknownRequest>> {
         let mut query = unknown_requests::Entity::find()
+            .filter(unknown_requests::Column::ProjectId.eq(project_id))
             .order_by_desc(unknown_requests::Column::LastSeenAt)
             .limit(limit);
 
@@ -69,8 +113,9 @@ impl UnknownRequestRepository for PostgresRepository {
 
 #[async_trait::async_trait]
 impl MockRouteRepository for PostgresRepository {
-    async fn list_routes(&self) -> RepositoryResult<Vec<MockRoute>> {
+    async fn list_routes(&self, project_id: Uuid) -> RepositoryResult<Vec<MockRoute>> {
         mock_routes::Entity::find()
+            .filter(mock_routes::Column::ProjectId.eq(project_id))
             .order_by_asc(mock_routes::Column::PathPattern)
             .all(&self.db)
             .await
@@ -91,13 +136,16 @@ impl MockRouteRepository for PostgresRepository {
 
     async fn upsert_route(
         &self,
+        project_id: Uuid,
         id: Option<Uuid>,
         request: UpsertRoute,
     ) -> RepositoryResult<MockRoute> {
         validate_route_request(&request)?;
+        ensure_project_exists(&self.db, project_id).await?;
 
         if let Some(id) = id {
             let route = mock_routes::Entity::find_by_id(id)
+                .filter(mock_routes::Column::ProjectId.eq(project_id))
                 .one(&self.db)
                 .await
                 .context("failed to load route")?
@@ -115,6 +163,7 @@ impl MockRouteRepository for PostgresRepository {
         }
 
         let route = mock_routes::ActiveModel {
+            project_id: Set(project_id),
             method: Set(request.method.to_uppercase()),
             path_pattern: Set(request.path_pattern),
             name: Set(request.name),
@@ -218,10 +267,12 @@ impl MockRouteRepository for PostgresRepository {
 
     async fn find_active_response(
         &self,
+        project_id: Uuid,
         method: &str,
         path: &str,
     ) -> RepositoryResult<Option<ActiveMockResponse>> {
         let Some(route) = mock_routes::Entity::find()
+            .filter(mock_routes::Column::ProjectId.eq(project_id))
             .filter(mock_routes::Column::Method.eq(method.to_uppercase()))
             .filter(mock_routes::Column::PathPattern.eq(path))
             .filter(mock_routes::Column::Status.eq(mock_routes::RouteStatus::Active))
@@ -252,6 +303,7 @@ impl MockRouteRepository for PostgresRepository {
 
     async fn convert_unknown_request(
         &self,
+        project_id: Uuid,
         id: Uuid,
         request: ConvertUnknownRequest,
     ) -> RepositoryResult<ConvertedUnknownRequest> {
@@ -261,7 +313,7 @@ impl MockRouteRepository for PostgresRepository {
             .await
             .context("failed to begin conversion transaction")?;
 
-        let result = convert_unknown_request_tx(&tx, id, request).await;
+        let result = convert_unknown_request_tx(&tx, project_id, id, request).await;
 
         match result {
             Ok(converted) => {
@@ -280,7 +332,11 @@ impl MockRouteRepository for PostgresRepository {
     }
 }
 
-async fn capture_unknown<C>(db: &C, request: CapturedRequest) -> RepositoryResult<UnknownRequest>
+async fn capture_unknown<C>(
+    db: &C,
+    project_id: Uuid,
+    request: CapturedRequest,
+) -> RepositoryResult<UnknownRequest>
 where
     C: ConnectionTrait,
 {
@@ -289,9 +345,9 @@ where
         serde_json::to_string(&request.headers).context("failed to encode header JSON")?;
 
     let sql = r#"
-        INSERT INTO unknown_requests (method, path, query, headers, body)
-        VALUES ($1, $2, $3::jsonb, $4::jsonb, $5)
-        ON CONFLICT (method, path) DO UPDATE
+        INSERT INTO unknown_requests (project_id, method, path, query, headers, body)
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6)
+        ON CONFLICT (project_id, method, path) DO UPDATE
         SET
             query = EXCLUDED.query,
             headers = EXCLUDED.headers,
@@ -303,7 +359,7 @@ where
                 ELSE 'new'::unknown_request_status
             END
         RETURNING
-            id, method, path, query, headers, body, first_seen_at, last_seen_at,
+            id, project_id, method, path, query, headers, body, first_seen_at, last_seen_at,
             count, status::text AS status, converted_route_id
     "#;
 
@@ -312,6 +368,7 @@ where
             db.get_database_backend(),
             sql,
             vec![
+                project_id.into(),
                 request.method.to_uppercase().into(),
                 request.path.into(),
                 query.into(),
@@ -328,12 +385,15 @@ where
 
 async fn convert_unknown_request_tx(
     tx: &DatabaseTransaction,
+    project_id: Uuid,
     id: Uuid,
     request: ConvertUnknownRequest,
 ) -> RepositoryResult<ConvertedUnknownRequest> {
     validate_convert_request(&request)?;
+    ensure_project_exists(tx, project_id).await?;
 
     let unknown = unknown_requests::Entity::find_by_id(id)
+        .filter(unknown_requests::Column::ProjectId.eq(project_id))
         .one(tx)
         .await
         .context("failed to load unknown request")?
@@ -364,6 +424,7 @@ async fn convert_unknown_request_tx(
     });
 
     let route = mock_routes::ActiveModel {
+        project_id: Set(project_id),
         method: Set(unknown.method.clone()),
         path_pattern: Set(unknown.path.clone()),
         name: Set(route_name),
@@ -376,7 +437,7 @@ async fn convert_unknown_request_tx(
     .map_err(|error| {
         if error
             .to_string()
-            .contains("mock_routes_method_path_pattern_key")
+            .contains("mock_routes_project_method_path_pattern_key")
         {
             RepositoryError::Conflict("route already exists for this method and path".to_string())
         } else {
@@ -496,6 +557,9 @@ fn unknown_from_row(row: &sea_orm::QueryResult) -> RepositoryResult<UnknownReque
     let status: String = row.try_get("", "status").context("missing status")?;
     Ok(UnknownRequest {
         id: row.try_get("", "id").context("missing id")?,
+        project_id: row
+            .try_get("", "project_id")
+            .context("missing project_id")?,
         method: row.try_get("", "method").context("missing method")?,
         path: row.try_get("", "path").context("missing path")?,
         query: row.try_get("", "query").context("missing query")?,
@@ -521,6 +585,7 @@ impl TryFrom<unknown_requests::Model> for UnknownRequest {
     fn try_from(value: unknown_requests::Model) -> Result<Self, Self::Error> {
         Ok(Self {
             id: value.id,
+            project_id: value.project_id,
             method: value.method,
             path: value.path,
             query: value.query,
@@ -541,6 +606,7 @@ impl TryFrom<mock_routes::Model> for MockRoute {
     fn try_from(value: mock_routes::Model) -> Result<Self, Self::Error> {
         Ok(Self {
             id: value.id,
+            project_id: value.project_id,
             method: value.method,
             path_pattern: value.path_pattern,
             name: value.name,
@@ -550,6 +616,19 @@ impl TryFrom<mock_routes::Model> for MockRoute {
                 mock_routes::RouteStatus::Disabled => crate::domain::RouteStatus::Disabled,
             },
             active_scenario_id: value.active_scenario_id,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        })
+    }
+}
+
+impl TryFrom<projects::Model> for Project {
+    type Error = RepositoryError;
+
+    fn try_from(value: projects::Model) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: value.id,
+            name: value.name,
             created_at: value.created_at,
             updated_at: value.updated_at,
         })
@@ -594,6 +673,22 @@ where
     }
 }
 
+async fn ensure_project_exists<C>(db: &C, project_id: Uuid) -> RepositoryResult<()>
+where
+    C: ConnectionTrait,
+{
+    let exists = projects::Entity::find_by_id(project_id)
+        .one(db)
+        .await
+        .context("failed to load project")?
+        .is_some();
+    if exists {
+        Ok(())
+    } else {
+        Err(RepositoryError::NotFound)
+    }
+}
+
 async fn insert_route<C>(route: mock_routes::ActiveModel, db: &C) -> RepositoryResult<MockRoute>
 where
     C: ConnectionTrait,
@@ -617,11 +712,19 @@ where
 }
 
 fn map_route_write_error(error: sea_orm::DbErr) -> RepositoryError {
-    if error
-        .to_string()
-        .contains("mock_routes_method_path_pattern_key")
+    let message = error.to_string();
+    if message.contains("mock_routes_method_path_pattern_key")
+        || message.contains("mock_routes_project_method_path_pattern_key")
     {
         RepositoryError::Conflict("route already exists for this method and path".to_string())
+    } else {
+        RepositoryError::Internal(error.into())
+    }
+}
+
+fn map_project_write_error(error: sea_orm::DbErr) -> RepositoryError {
+    if error.to_string().contains("projects_name_key") {
+        RepositoryError::Conflict("project already exists with this name".to_string())
     } else {
         RepositoryError::Internal(error.into())
     }
@@ -648,6 +751,15 @@ fn fill_profile_model(model: &mut response_scenarios::ActiveModel, request: Crea
     model.response_body = Set(request.response_body);
     model.delay_ms = Set(request.delay_ms);
     model.selection_rules = Set(request.selection_rules);
+}
+
+fn validate_project_request(request: &CreateProject) -> RepositoryResult<()> {
+    if request.name.trim().is_empty() {
+        return Err(RepositoryError::Validation(
+            "project.name cannot be empty".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn to_db_route_status(status: crate::domain::RouteStatus) -> mock_routes::RouteStatus {

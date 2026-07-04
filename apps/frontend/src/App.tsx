@@ -4,6 +4,7 @@ import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline';
 import CloseIcon from '@mui/icons-material/Close';
 import EditIcon from '@mui/icons-material/Edit';
 import ErrorOutlineIcon from '@mui/icons-material/ErrorOutline';
+import FolderIcon from '@mui/icons-material/Folder';
 import InboxIcon from '@mui/icons-material/Inbox';
 import LanIcon from '@mui/icons-material/Lan';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
@@ -122,8 +123,21 @@ type RouteStatus = 'active' | 'disabled';
 type ProfileKind = 'static' | 'dynamic';
 type CommonHttpMethod = (typeof COMMON_HTTP_METHODS)[number];
 
+interface Project {
+  id: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ProjectsResponse {
+  items: Project[];
+  active_project_id: string;
+}
+
 interface UnknownRequest {
   id: string;
+  project_id: string;
   method: string;
   path: string;
   query: Record<string, string>;
@@ -139,6 +153,7 @@ interface UnknownRequest {
 
 interface MockRoute {
   id: string;
+  project_id: string;
   method: string;
   path_pattern: string;
   name: string;
@@ -211,6 +226,10 @@ const statusColors: Record<UnknownRequestStatus, 'default' | 'success' | 'warnin
 
 export default function App() {
   const [tab, setTab] = useState(0);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string>('');
+  const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const [projectName, setProjectName] = useState('');
   const [unknownRequests, setUnknownRequests] = useState<UnknownRequest[]>([]);
   const [routes, setRoutes] = useState<MockRoute[]>([]);
   const [selected, setSelected] = useState<UnknownRequest | null>(null);
@@ -237,14 +256,33 @@ export default function App() {
     [unknownRequests]
   );
 
+  const loadProjects = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const response = await apiGet<ProjectsResponse>('/projects');
+      setProjects(response.items);
+      setSelectedProjectId((current) => current || response.active_project_id || response.items[0]?.id || '');
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   const loadData = useCallback(async () => {
+    if (!selectedProjectId) {
+      return;
+    }
+
     setLoading(true);
     setError(null);
 
     try {
       const [unknownResponse, routesResponse] = await Promise.all([
-        apiGet<ListResponse<UnknownRequest>>('/unknown-requests'),
-        apiGet<ListResponse<MockRoute>>('/routes')
+        apiGet<ListResponse<UnknownRequest>>(projectPath('/unknown-requests', selectedProjectId)),
+        apiGet<ListResponse<MockRoute>>(projectPath('/routes', selectedProjectId))
       ]);
 
       setUnknownRequests(unknownResponse.items);
@@ -254,7 +292,11 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    void loadProjects();
+  }, [loadProjects]);
 
   useEffect(() => {
     void loadData();
@@ -269,13 +311,51 @@ export default function App() {
     socket.on('connect', () => setRealtimeConnected(true));
     socket.on('disconnect', () => setRealtimeConnected(false));
     socket.on(UNKNOWN_REQUEST_CAPTURED_EVENT, (request: UnknownRequest) => {
+      if (request.project_id !== selectedProjectId) {
+        return;
+      }
       setUnknownRequests((current) => mergeUnknownRequest(current, request));
     });
 
     return () => {
       socket.disconnect();
     };
-  }, []);
+  }, [selectedProjectId]);
+
+  async function selectProject(projectId: string) {
+    setSelectedProjectId(projectId);
+    setSelected(null);
+    setEditingRoute(null);
+    setError(null);
+    setNotice(null);
+    try {
+      await apiPut(`/projects/${projectId}/active`, {});
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
+  }
+
+  async function createProject() {
+    if (!projectName.trim()) {
+      setError('Project name cannot be empty');
+      return;
+    }
+
+    setSaving(true);
+    setError(null);
+    try {
+      const project = await apiPost<Project>('/projects', { name: projectName.trim() });
+      setProjects((current) => [...current, project].sort((left, right) => left.name.localeCompare(right.name)));
+      setSelectedProjectId(project.id);
+      setProjectName('');
+      setProjectDialogOpen(false);
+      setNotice('Project created');
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setSaving(false);
+    }
+  }
 
   function openConvertDialog(request: UnknownRequest) {
     setSelected(request);
@@ -318,7 +398,7 @@ export default function App() {
     setSaving(true);
     setError(null);
     try {
-      const route = await apiPut<MockRoute>(`/routes/${editingRoute.id}`, {
+      const route = await apiPut<MockRoute>(projectPath(`/routes/${editingRoute.id}`, selectedProjectId), {
         method: normalizeHttpMethod(routeForm.method),
         path_pattern: routeForm.pathPattern,
         name: routeForm.name,
@@ -407,7 +487,7 @@ export default function App() {
 
     try {
       const responseHeaders = parseJsonObject(form.responseHeaders, 'Response headers');
-      await apiPost(`/unknown-requests/${selected.id}/convert`, {
+      await apiPost(projectPath(`/unknown-requests/${selected.id}/convert`, selectedProjectId), {
         name: form.name || undefined,
         tags: splitTags(form.tags),
         scenario: profilePayload({ ...form, responseHeaders: JSON.stringify(responseHeaders, null, 2) })
@@ -432,6 +512,29 @@ export default function App() {
           <Typography variant="h6" component="h1" sx={{ ml: 1.5, fontWeight: 700 }}>
             Mock Machine
           </Typography>
+          <FolderIcon fontSize="small" sx={{ ml: 2, mr: 1, color: 'text.secondary' }} />
+          <FormControl size="small" sx={{ minWidth: 220 }} disabled={projects.length === 0}>
+            <InputLabel id="project-select-label">Project</InputLabel>
+            <Select
+              labelId="project-select-label"
+              label="Project"
+              value={selectedProjectId}
+              onChange={(event) => void selectProject(event.target.value)}
+            >
+              {projects.map((project) => (
+                <MenuItem key={project.id} value={project.id}>
+                  {project.name}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <Tooltip title="New project">
+            <span>
+              <IconButton sx={{ ml: 0.5 }} onClick={() => setProjectDialogOpen(true)}>
+                <AddIcon />
+              </IconButton>
+            </span>
+          </Tooltip>
           <Chip
             size="small"
             label={realtimeConnected ? 'Realtime' : 'Offline'}
@@ -518,6 +621,31 @@ export default function App() {
         onEditProfile={editProfile}
         onActivateProfile={activateProfile}
       />
+      <Dialog open={projectDialogOpen} onClose={() => setProjectDialogOpen(false)} fullWidth maxWidth="xs">
+        <DialogTitle className="dialogTitle">
+          <Typography variant="h6" component="div">
+            New project
+          </Typography>
+          <IconButton onClick={() => setProjectDialogOpen(false)} aria-label="Close">
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <TextField
+            autoFocus
+            label="Project name"
+            value={projectName}
+            onChange={(event) => setProjectName(event.target.value)}
+            fullWidth
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setProjectDialogOpen(false)}>Cancel</Button>
+          <Button variant="contained" startIcon={<SaveIcon />} onClick={createProject} disabled={saving}>
+            Create
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }
@@ -1167,6 +1295,11 @@ function splitTags(value: string): string[] {
 
 function normalizeHttpMethod(value: string): string {
   return value.trim().toUpperCase();
+}
+
+function projectPath(path: string, projectId: string): string {
+  const separator = path.includes('?') ? '&' : '?';
+  return `${path}${separator}project_id=${encodeURIComponent(projectId)}`;
 }
 
 function mergeUnknownRequest(requests: UnknownRequest[], next: UnknownRequest): UnknownRequest[] {

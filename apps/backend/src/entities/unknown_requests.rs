@@ -24,6 +24,7 @@ pub enum UnknownRequestStatus {
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
+    pub project_id: Uuid,
     pub method: String,
     pub path: String,
     pub query: Value,
